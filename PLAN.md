@@ -1,238 +1,122 @@
 # Inference Gateway — Development Plan
 
-## Current State
-
-The gateway is a working Phase 2 system with:
-- ✅ Judge-based routing (Arch-Router-1.5B)
-- ✅ Memory protection with admission control
-- ✅ Response cache (exact-match, non-streaming)
-- ✅ 3 benchmark suites (quick, coding_hitl, reasoning)
-- ✅ Real-time dashboard
-- ✅ Stack control script
-
-## Phase 3: Production-Ready Open Source
-
-### 1. CI/CD Pipeline (GitHub Actions)
-
-**Goal:** Automated testing, linting, and deployment on every push.
-
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: macos-latest  # Apple Silicon runner
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: pytest tests/ -v
-      - run: ruff check .
-      - run: mypy proxy.py
-```
-
-**Deliverables:**
-- [ ] `tests/` directory with unit + integration tests
-- [ ] `pytest` test suite
-- [ ] `ruff` linter config
-- [ ] `mypy` type checking
-- [ ] GitHub Actions workflow
-- [ ] Pre-commit hooks
-
-### 2. Controlled Testing Environment
-
-**Goal:** Reproducible test environment that doesn't require actual models.
-
-**Approach:**
-- Mock oMLX server (FastAPI test app)
-- Mock judge model responses
-- Fixture-based test data
-- Integration tests with real models (optional, tagged)
+## Task Dependency Chart
 
 ```
-tests/
-├── conftest.py          # Shared fixtures
-├── mock_omlx.py         # Mock oMLX server
-├── test_proxy.py        # Unit tests for proxy logic
-├── test_routing.py      # Routing decision tests
-├── test_cache.py        # Cache behavior tests
-├── test_memory.py       # Memory guard tests
-├── test_benchmarks.py   # Benchmark evaluation tests
-└── integration/
-    └── test_e2e.py      # End-to-end (requires real models)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Task Dependency Graph                                 │
+│                                                                         │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
+│  │  Task 1  │    │  Task 2  │    │  Task 3  │    │  Task 4  │         │
+│  │  CI/CD   │    │  Testing │    │  Rationale│   │  Benchmarks│        │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘         │
+│       │               │               │               │                │
+│       │               │               │               │                │
+│       ▼               ▼               ▼               ▼                │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
+│  │  Task 5  │    │  Task 6  │    │  Task 7  │    │  Task 8  │         │
+│  │  Cache   │    │  Backend │    │  Refine  │    │  Release │         │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘         │
+│       │               │               │               │                │
+│       │               │               │               │                │
+│       └───────────────┴───────────────┴───────────────┘                │
+│                               │                                         │
+│                               ▼                                         │
+│                      ┌─────────────────┐                               │
+│                      │  All Complete   │                               │
+│                      │  (Open Source)  │                               │
+│                      └─────────────────┘                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3. Enhanced Cache Support
+## Dependency Matrix
 
-**Current:** Exact-match, non-streaming only, 128 entries, 300s TTL.
+| Task | Depends On | Blocks | Can Start |
+|------|-----------|--------|-----------|
+| Task 1: CI/CD | None | Task 8 | Immediately |
+| Task 2: Testing | None | Task 6, Task 8 | Immediately |
+| Task 3: Rationale | None | Task 7 | Immediately |
+| Task 4: Benchmarks | None | Task 7, Task 8 | Immediately |
+| Task 5: Cache | None | Task 8 | Immediately |
+| Task 6: Backend | Task 2 | Task 8 | After Task 2 |
+| Task 7: Refinement | Task 3, Task 4 | Task 8 | After Task 3 & 4 |
+| Task 8: Release | All tasks | None | After all complete |
 
-**Enhancements:**
-- [ ] Semantic cache (embedding-based similarity)
-- [ ] Streaming response caching (capture full stream, replay)
-- [ ] Cache invalidation on model swap
-- [ ] Cache metrics dashboard (hit rate, eviction rate)
-- [ ] Configurable cache per route (moe vs dense)
+## Task Summary
 
-### 4. Additional Benchmark Suites (5+ new)
+| # | Task | File | Effort | Status |
+|---|------|------|--------|--------|
+| 1 | CI/CD Pipeline | [docs/task-1-cicd.md](docs/task-1-cicd.md) | 2-3 days | ⬜ Not Started |
+| 2 | Testing Environment | [docs/task-2-testing.md](docs/task-2-testing.md) | 1-2 days | ⬜ Not Started |
+| 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | 1 day | ⬜ Not Started |
+| 4 | Benchmark Suites | [docs/task-4-benchmarks.md](docs/task-4-benchmarks.md) | 2-3 days | ⬜ Not Started |
+| 5 | Cache Enhancement | [docs/task-5-cache.md](docs/task-5-cache.md) | 1-2 days | ⬜ Not Started |
+| 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | 2-3 days | ⬜ Not Started |
+| 7 | Instruction Refinement | [docs/task-7-refinement.md](docs/task-7-refinement.md) | 1-2 days | ⬜ Not Started |
+| 8 | Open Source Release | [docs/task-8-release.md](docs/task-8-release.md) | 1-2 days | ⬜ Not Started |
 
-**Goal:** Highlight differences and capabilities of the two models.
+**Total: 11-18 days**
 
-| Suite | Description | What It Tests |
-|-------|-------------|---------------|
-| `code_review` | Review a 500-line codebase for bugs | Deep code understanding |
-| `refactoring` | Refactor a complex module | Multi-step editing |
-| `debugging` | Find and fix a subtle concurrency bug | Root cause analysis |
-| `architecture` | Design a distributed system | Systems reasoning |
-| `security` | Identify and fix security vulnerabilities | Security awareness |
-| `performance` | Optimize a slow algorithm | Performance tuning |
-| `documentation` | Write comprehensive API docs | Technical writing |
+## Agentic Pipeline Overview
 
-Each suite:
-- Has a static rubric for automated evaluation
-- Captures full Pi agent session
-- Measures: swap time, TTFT, latency, tokens, tool calls, errors
-- Supports human verdict (pass/partial/fail)
+Each task is executed by a team of agents working in a pipeline:
 
-### 5. Routing Rationale Capture
-
-**Goal:** Understand *why* the judge chose a specific model.
-
-**Implementation:**
-```python
-# In arch_router_policy(), capture the judge's reasoning
-judge_response = {
-    "route": "dense",
-    "confidence": 0.85,
-    "reason": "Complex multi-module refactoring requires deep code understanding",
-    "task_type": "complex_analysis",
-    "effort": "high",
-    "thinking": True,
-    "judge_raw": "The request involves refactoring a 500-line module...",
-    "judge_tokens": 42,
-    "judge_latency_ms": 1200,
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Agentic Development Pipeline                        │
+│                                                                         │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                │
+│  │  Developer  │───▶│  Tester     │───▶│  Engineer   │───▶┌────────┐ │
+│  │  Agent      │    │  Agent      │    │  Agent      │    │  QA    │ │
+│  └─────────────┘    └─────────────┘    └─────────────┘    │  Agent │ │
+│        │                    │                    │          └────────┘ │
+│        ▼                    ▼                    ▼               │     │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │     │
+│  │  Write code │    │  Run tests  │    │  Deploy &   │          │     │
+│  │  + docs     │    │  locally    │    │  verify     │          │     │
+│  └─────────────┘    └─────────────┘    └─────────────┘          │     │
+│        │                    │                    │               │     │
+│        └────────────────────┴────────────────────┘───────────────┘     │
+│                              │                                          │
+│                              ▼                                          │
+│                     ┌─────────────────┐                                │
+│                     │  Final Review   │                                │
+│                     │  + Merge        │                                │
+│                     └─────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Storage:**
-- Per-request: `route_reason`, `judge_raw`, `judge_latency_ms`
-- Aggregated: routing accuracy metrics, false positive/negative tracking
+### Agent Roles
 
-**Dashboard:**
-- "Routing Decisions" tab with expandable rationale
-- Filter by route, confidence, task type
-- Export to CSV for analysis
-
-### 6. Instruction Refinement Loop
-
-**Goal:** Incrementally improve routing accuracy based on outcomes.
-
-**Approach:**
-1. **Log outcomes** — track which route produced better results (human verdict, benchmark score)
-2. **Analyze patterns** — identify task types where routing was suboptimal
-3. **Update route descriptions** — refine `router.yaml` descriptions based on evidence
-4. **A/B test** — run benchmarks with updated descriptions, compare accuracy
-5. **Version control** — track description changes in git
-
-```yaml
-# router.yaml (versioned)
-version: 3
-routes:
-  moe:
-    description: >-
-      Fast workhorse for structured output, tool use, data analysis,
-      summarization, general reasoning, and routine coding.
-      Best for: quick tasks, iterative agent work, moderate complexity.
-      Avoid: complex refactoring, security audits, architecture design.
-  dense:
-    description: >-
-      High-quality specialist for complex code review, architecture redesign,
-      difficult debugging, and demanding code generation.
-      Best for: multi-module refactoring, security audits, systems design.
-      Avoid: simple transformations, quick summaries.
-```
-
-### 7. Generic Model Backend Support
-
-**Goal:** Work with any model hosting framework, not just oMLX.
-
-**Abstraction layer:**
-```python
-class ModelBackend(ABC):
-    @abstractmethod
-    async def load_model(self, model_id: str) -> None: ...
-    @abstractmethod
-    async def unload_model(self, model_id: str) -> None: ...
-    @abstractmethod
-    async def is_loaded(self, model_id: str) -> bool: ...
-    @abstractmethod
-    async def chat(self, model_id: str, messages: list) -> AsyncIterator: ...
-
-class OMLXBackend(ModelBackend): ...
-class MLXBackend(ModelBackend): ...
-class LLAMABackend(ModelBackend): ...
-class OpenAIBackend(ModelBackend): ...  # For cloud fallback
-```
-
-**Configuration:**
-```yaml
-backends:
-  omlx:
-    type: omlx
-    url: http://127.0.0.1:8080
-  mlx:
-    type: mlx
-    url: http://127.0.0.1:8081
-  llama:
-    type: llama
-    url: http://127.0.0.1:8082
-```
-
-### 8. Open Source Release
-
-**Deliverables:**
-- [ ] `LICENSE` (MIT or Apache 2.0)
-- [ ] `CONTRIBUTING.md`
-- [ ] `CODE_OF_CONDUCT.md`
-- [ ] `pyproject.toml` (proper packaging)
-- [ ] `Makefile` (common tasks)
-- [ ] `docker-compose.yml` (optional containerized setup)
-- [ ] `docs/` directory with:
-  - `installation.md`
-  - `configuration.md`
-  - `api-reference.md`
-  - `benchmarks.md`
-  - `troubleshooting.md`
-- [ ] GitHub repository with:
-  - Issues template
-  - PR template
-  - Release automation
-  - Community discussion
+| Agent | Responsibility | Tools |
+|-------|---------------|-------|
+| **Developer** | Write code, create docs, implement features | `write`, `edit` |
+| **Tester** | Run tests, verify behavior, check edge cases | `bash` (pytest, curl) |
+| **Engineer** | Deploy, verify integration, check CI | `bash` (git, curl) |
+| **QA** | Final review, check for regressions, approve | `read`, `bash` |
 
 ## Execution Order
 
-| Phase | Task | Effort | Priority |
-|-------|------|--------|----------|
-| 1 | CI/CD pipeline + tests | 2-3 days | High |
-| 2 | Controlled testing environment | 1-2 days | High |
-| 3 | Routing rationale capture | 1 day | High |
-| 4 | 5+ new benchmark suites | 2-3 days | Medium |
-| 5 | Enhanced cache support | 1-2 days | Medium |
-| 6 | Generic backend abstraction | 2-3 days | Medium |
-| 7 | Instruction refinement loop | 1-2 days | Low |
-| 8 | Open source release | 1-2 days | High |
+### Phase 1: Foundation (Week 1)
+1. **Task 1: CI/CD** — Set up automated testing pipeline
+2. **Task 2: Testing** — Create controlled test environment
 
-**Total estimated effort: 11-18 days**
+### Phase 2: Core Features (Week 2)
+3. **Task 3: Rationale** — Capture routing decisions
+4. **Task 4: Benchmarks** — Add 5+ new benchmark suites
+5. **Task 5: Cache** — Enhance cache with semantic dedup
 
-## Success Metrics
+### Phase 3: Advanced Features (Week 3)
+6. **Task 6: Backend** — Abstract backend for portability
+7. **Task 7: Refinement** — Create instruction refinement loop
 
-- [ ] 100% test coverage on core routing logic
-- [ ] 5+ new benchmark suites with automated evaluation
-- [ ] Routing accuracy > 80% (measured by human verdict)
-- [ ] Cache hit rate > 30% on repeat workloads
-- [ ] Zero OOM crashes under sustained load
-- [ ] Clean `ruff` + `mypy` pass
-- [ ] Successful open-source release with community docs
+### Phase 4: Release (Week 4)
+8. **Task 8: Release** — Prepare for open source
+
+## Notes
+
+- Tasks 1-5 are independent and can be worked on in parallel
+- Task 6 requires Task 2 (testing environment) for validation
+- Task 7 requires Task 3 (rationale data) and Task 4 (benchmark results)
+- Task 8 requires all other tasks to be complete
+- Each task file is self-contained with architecture diagrams, step-by-step instructions, and agentic pipeline explanations
