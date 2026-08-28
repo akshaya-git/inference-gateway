@@ -1,0 +1,35 @@
+version: 1
+
+judge:
+  model: Arch-Router-1.5B-mlx-8Bit
+  max_tokens: 64
+  temperature: 0.0
+  timeout_seconds: 30
+  enable_thinking: false
+  reload_if_evicted: true
+
+routes:
+  moe:
+    model: Qwen3.6-35B-A3B-oQ5e-mtp
+    judge_name: moe_workhorse
+    description: >-
+      Fast workhorse for structured output, tool use, fitness and data analysis,
+      summarization, general reasoning, research synthesis, iterative agent work,
+      and routine through moderately complex coding, debugging, and feature work.
+  dense:
+    model: Qwen3.8-27B-oQ4e-mtp
+    judge_name: dense_specialist
+    description: >-
+      High-quality specialist for substantial application or agent builds,
+      repository-wide code review, architecture redesign, complex cross-module
+      implementation, difficult concurrency or security debugging, and demanding
+      code generation where quality is more important than latency.
+
+routing:
+  evaluate_every_request: true
+  include_recent_conversation: true
+  include_tool_messages: true
+  include_runtime_state: true
+  prefer_resident_when_similar: true
+  context_characters: 24000
+  fallback_route: moe
