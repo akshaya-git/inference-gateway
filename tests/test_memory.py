@@ -1,11 +1,9 @@
 """
 Tests for memory guard functionality.
 """
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 from proxy import (
-    MEMORY_GUARD_GB,
-    MEMORY_HARD_GB,
     memory_state,
     update_memory_state,
 )
