@@ -2,11 +2,12 @@
 Performance benchmarking against the real running stack.
 Uses unique prompts to avoid cache hits.
 """
-import time
 import json
-import httpx
 import statistics
+import time
 import uuid
+
+import httpx
 
 
 def benchmark_model(client: httpx.Client, model: str, prompt: str, iterations: int = 5) -> dict:
@@ -18,7 +19,7 @@ def benchmark_model(client: httpx.Client, model: str, prompt: str, iterations: i
     for i in range(iterations):
         # Add unique ID to avoid cache hits
         unique_prompt = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
-        
+
         start = time.time()
         response = client.post("/v1/chat/completions", json={
             "model": model,
