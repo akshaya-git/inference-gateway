@@ -3,6 +3,7 @@ Integration tests for the gateway.
 """
 import pytest
 from fastapi.testclient import TestClient
+
 from proxy import app
 
 

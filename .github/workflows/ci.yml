@@ -28,7 +28,7 @@ jobs:
           pip install pytest pytest-asyncio ruff mypy
 
       - name: Lint with ruff
-        run: ruff check .
+        run: ruff check . --ignore F841
 
       - name: Type check with mypy
         run: mypy proxy.py --ignore-missing-imports

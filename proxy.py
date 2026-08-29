@@ -21,22 +21,21 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import re
 import shutil
 import subprocess
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 import httpx
 import psutil
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 logger = logging.getLogger("inference-gateway")
 
@@ -2078,8 +2077,6 @@ async def stream_request(
     finish_reason = ""
     usage: dict = {}
     upstream_status = 200
-    last_event_ms = None
-    first_token_ms = None
     stream_events = 0
     low_memory_events = 0
     swap_ms = 0.0
@@ -2197,13 +2194,11 @@ async def stream_upstream(body: dict, req_id: str, route: str):
                 content_text, reasoning_text = stream_delta_text(obj)
                 now = now_ms()
                 stream_events += 1
-                last_event_ms = now
 
                 # Role-only deltas, keep-alives and usage metadata are not
                 # generated tokens. Start TTFT on real answer/reasoning text.
                 if ttft_ms is None and (content_text or reasoning_text):
                     ttft_ms = now - request_t0
-                    first_token_ms = now
 
                 u = extract_usage(obj)
                 for k, v in u.items():
