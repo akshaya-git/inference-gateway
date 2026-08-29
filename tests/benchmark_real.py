@@ -1,10 +1,11 @@
 """
 Performance benchmarking against the real running stack.
 """
-import time
 import json
-import httpx
 import statistics
+import time
+
+import httpx
 
 
 def benchmark_model(client: httpx.Client, model: str, prompt: str, iterations: int = 5) -> dict:

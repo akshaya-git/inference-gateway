@@ -1,9 +1,10 @@
 """
 Real integration tests against the running oMLX stack.
 """
-import pytest
 import time
+
 import httpx
+import pytest
 
 
 @pytest.fixture
