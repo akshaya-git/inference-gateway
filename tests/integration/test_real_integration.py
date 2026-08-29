@@ -6,6 +6,8 @@ import time
 import httpx
 import pytest
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def gateway_client():
