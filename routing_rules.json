@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "dense_above": 4,
+  "levels": {"1":"Mechanical edit", "2":"Small implementation", "3":"Self-contained feature", "4":"Complex stateful feature", "5":"Demanding integration", "6":"System-level change"},
+  "code_terms": ["code", "html", "svg", "css", "javascript", "python", "function", "script", "api", "database", "tetris", "kanban", "dashboard", "visualizer", "frontend", "backend", "refactor", "bug", "test"],
+  "base_rules": [
+    {"id":"mechanical", "level":1, "terms":["rename a variable", "change a color", "fix a typo", "change this button"]},
+    {"id":"small", "level":2, "terms":["one function", "small script", "input validation"]},
+    {"id":"stateful", "level":4, "terms":["tetris", "kanban", "dashboard", "visualizer", "state machine"]},
+    {"id":"integration", "level":5, "terms":["frontend and backend", "authentication", "backward-compatible api"]},
+    {"id":"system", "level":6, "terms":["cross-service", "database migration", "concurrency repair", "security repair", "system redesign"]}
+  ],
+  "modifiers": [
+    {"id":"visual_polish", "terms":["polished", "visual polish", "beautiful", "detailed portrait"]},
+    {"id":"accessibility", "terms":["accessible", "accessibility", "screen reader"]},
+    {"id":"edge_cases", "terms":["demanding edge cases", "all edge cases", "race conditions"]},
+    {"id":"compatibility", "terms":["backward compatibility", "backwards compatible"]}
+  ]
+}

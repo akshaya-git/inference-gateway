@@ -96,3 +96,44 @@ class TestBenchmarks:
         response = "Key points:\n• 45% of issues are billing-related\n• Average resolution time is 4.2 hours\n• Technical issues take longest (7.8 hours)\n• Customer satisfaction is 4.2/5 overall"
         result = evaluate_benchmark_output("summarization", response, "stop", 200, {"completion_tokens": 50})
         assert result["readiness_score"] > 0
+
+
+def test_generation_average_is_time_weighted():
+    from proxy import benchmark_generation_stats
+    result = benchmark_generation_stats([
+        {'completion_tokens': 100, 'generation_ms': 1000},
+        {'completion_tokens': 100, 'generation_ms': 9000},
+    ])
+    assert result == {'average_tps': 20.0, 'generation_ms': 10000}
+
+
+def test_generation_average_missing_timing_is_unavailable():
+    from proxy import benchmark_generation_stats
+    assert benchmark_generation_stats([])['average_tps'] is None
+    assert benchmark_generation_stats([
+        {'completion_tokens': 100, 'generation_ms': 1000},
+        {'completion_tokens': 100},
+    ])['average_tps'] is None
+
+
+def test_new_artifact_suites(tmp_path):
+    from proxy import BENCHMARK_SUITES, find_benchmark_artifact
+    for suite in ['browser_tetris', 'svg_portrait', 'kanban_board', 'csv_dashboard', 'pathfinding_visualizer']:
+        config = BENCHMARK_SUITES[suite]
+        folder = tmp_path / suite
+        folder.mkdir()
+        artifact = folder / ('artifact.' + config['artifact_extension'])
+        artifact.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>' if suite == 'svg_portrait' else '<!doctype html><html></html>')
+        assert find_benchmark_artifact(str(folder), suite) == str(artifact)
+        result = evaluate_benchmark_output(suite, artifact.read_text(), 'stop', 200, {})
+        assert result['categories']['instruction_adherence']['checks'][0]['passed']
+    assert BENCHMARK_SUITES['svg_portrait']['subjects'] == ['Mahatma Gandhi', 'Abraham Lincoln', 'Mother Teresa', 'Nelson Mandela']
+
+
+async def test_svg_endpoint(monkeypatch):
+    import proxy
+    monkeypatch.setattr(proxy, 'benchmark_result', lambda _: {'suite': 'svg_portrait', 'response': '<svg xmlns="http://www.w3.org/2000/svg"/>'})
+    response = await proxy.benchmark_artifact('test')
+    assert response.status_code == 200
+    assert response.media_type == 'image/svg+xml'
+    assert 'sandbox' in response.headers['content-security-policy']

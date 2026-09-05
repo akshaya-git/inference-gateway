@@ -37,6 +37,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from routing_logic import RoutingEngine, strip_routing_controls
+
+ROUTING_ENGINE = RoutingEngine(os.path.join(os.path.dirname(__file__), "routing_rules.json"))
+
 logger = logging.getLogger("inference-gateway")
 
 # ---------------------------------------------------------------------------
@@ -60,25 +64,25 @@ def load_router_config() -> dict[str, Any]:
 
 
 ROUTER_CONFIG = load_router_config()
-JUDGE_CONFIG = ROUTER_CONFIG.get("judge") or {}
 ROUTE_CONFIG = ROUTER_CONFIG.get("routes") or {}
 ROUTING_CONFIG = ROUTER_CONFIG.get("routing") or {}
 
 HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 PORT = int(os.getenv("PROXY_PORT", "9000"))
-MODEL_CONTEXT_WINDOW = int(os.getenv("MODEL_CONTEXT_WINDOW", "131072"))
+MODEL_CONTEXT_WINDOW = int(os.getenv("MODEL_CONTEXT_WINDOW", "128000"))
 
-OMLX_UPSTREAM = os.getenv("OMLX_UPSTREAM", "http://127.0.0.1:8080")
+OMLX_UPSTREAM = os.getenv("OMLX_UPSTREAM", "http://127.0.0.1:8000")
+OMLX_API_KEY = os.getenv("OMLX_API_KEY", "")
+UPSTREAM_HEADERS = {"Authorization": f"Bearer {OMLX_API_KEY}"} if OMLX_API_KEY else {}
 OMLX_ADMIN = os.getenv("OMLX_ADMIN", f"{OMLX_UPSTREAM}/admin")
-ROUTER_MODEL = os.getenv("ROUTER_MODEL", str(JUDGE_CONFIG.get("model", "Arch-Router-1.5B-mlx-8Bit")))
-MOE_MODEL = os.getenv("MOE_MODEL", str((ROUTE_CONFIG.get("moe") or {}).get("model", "Qwen3.6-35B-A3B-oQ5e-mtp")))
-DENSE_MODEL = os.getenv("DENSE_MODEL", str((ROUTE_CONFIG.get("dense") or {}).get("model", "Qwen3.8-27B-oQ4e-mtp")))
+MOE_MODEL = os.getenv("MOE_MODEL", str((ROUTE_CONFIG.get("moe") or {}).get("model", "mlx-community--Qwen3.6-35B-A3B-6bit")))
+DENSE_MODEL = os.getenv("DENSE_MODEL", str((ROUTE_CONFIG.get("dense") or {}).get("model", "scottlowry--Qwen3.8-27B-oQ6e-mtp")))
 MODEL_ENDPOINTS = {
     "moe": os.getenv("MOE_UPSTREAM", OMLX_UPSTREAM),
     "dense": os.getenv("DENSE_UPSTREAM", OMLX_UPSTREAM),
 }
 MODEL_IDS = {"moe": MOE_MODEL, "dense": DENSE_MODEL}
-RUNTIME_MODEL_IDS = {"router": ROUTER_MODEL, **MODEL_IDS}
+RUNTIME_MODEL_IDS = dict(MODEL_IDS)
 MODEL_ROUTES = {value: key for key, value in MODEL_IDS.items()}
 BENCHMARK_MODEL_ALIASES = {
     "benchmark-moe": "moe",
@@ -92,10 +96,9 @@ AUTO_MODEL_ALIASES = {
         "AUTO_MODEL_ALIASES", "auto,local-model,inference-gateway,gateway-auto"
     ).split(",") if value.strip()
 }
-STACK_SCRIPT = os.getenv("INFERENCE_STACK_SCRIPT", os.path.expanduser("~/Documents/inference-stack.sh"))
-STATE_DIR = os.getenv("INFERENCE_STACK_STATE", os.path.expanduser("~/.inference-stack"))
+STATE_DIR = os.getenv("INFERENCE_STACK_STATE", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".inference-stack"))
 ROUTING_ENABLED = os.getenv("ROUTING_ENABLED", "true").lower() == "true"
-ROUTER_TIMEOUT_SEC = float(os.getenv("ROUTER_TIMEOUT_SEC", str(JUDGE_CONFIG.get("timeout_seconds", 30))))
+KEEP_MODELS_LOADED = os.getenv("KEEP_MODELS_LOADED", "true").lower() == "true"
 SWAP_TIMEOUT_SEC = float(os.getenv("SWAP_TIMEOUT_SEC", "240"))
 
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
@@ -110,10 +113,6 @@ PI_EVENT_STREAM_LIMIT_BYTES = int(os.getenv("PI_EVENT_STREAM_LIMIT_BYTES", str(3
 
 # Keep enough recent context for the one routing decision made at a task boundary.
 ROUTER_CONTEXT_CHARS = int(os.getenv("ROUTER_CONTEXT_CHARS", str(ROUTING_CONFIG.get("context_characters", 24000))))
-ROUTER_MAX_TOKENS = int(JUDGE_CONFIG.get("max_tokens", 64))
-ROUTER_TEMPERATURE = float(JUDGE_CONFIG.get("temperature", 0.0))
-ROUTER_THINKING = bool(JUDGE_CONFIG.get("enable_thinking", False))
-ROUTER_RELOAD_IF_EVICTED = bool(JUDGE_CONFIG.get("reload_if_evicted", True))
 FALLBACK_ROUTE = str(ROUTING_CONFIG.get("fallback_route", "moe"))
 if FALLBACK_ROUTE not in ("moe", "dense"):
     raise RuntimeError("routing.fallback_route must be 'moe' or 'dense'")
@@ -234,6 +233,109 @@ BENCHMARK_SUITES = {
         "temperature": 0.2,
     },
 }
+
+
+BENCHMARK_SUITES["coding_hitl"]["artifact_extension"] = "html"
+BENCHMARK_SUITES.update({'browser_tetris': {'name': 'Browser Tetris',
+                    'description': 'Keyboard and touch controls; wall rotation; line clear and '
+                                   'score; pause; restart after game over.',
+                    'prompt': 'Build a polished browser-based Tetris game in one self-contained '
+                              'artifact.html. Implement all seven tetrominoes, rotation with wall '
+                              'kicks, collision detection, line clearing, score, increasing '
+                              'levels, next-piece preview, pause/resume, restart, and game over. '
+                              'Include keyboard controls, on-screen touch buttons, and a visible '
+                              'controls guide. Use no external libraries or assets. Test rotations '
+                              'near walls, line clearing, pause, and restarting after game over.',
+                    'artifact_extension': 'html',
+                    'review_checklist': 'Keyboard and touch controls; wall rotation; line clear '
+                                        'and score; pause; restart after game over.',
+                    'max_tokens': 32000,
+                    'thinking': True,
+                    'reasoning_effort': 'medium'},
+ 'svg_portrait': {'name': 'SVG historical portrait',
+                  'description': 'Recognizable likeness without reading the caption; original '
+                                 'vector shapes; clean scaling; valid SVG.',
+                  'prompt': 'Create a recognizable, carefully composed vector portrait of Mahatma '
+                            'Gandhi as a standalone artifact.svg. Draw the likeness using original '
+                            'SVG paths and shapes; do not use embedded raster images, external '
+                            'assets, scripts, or a generic face with only a name label. Include a '
+                            'descriptive title and description, a scalable viewBox, and a '
+                            'restrained color palette. Capture distinctive facial features and '
+                            'clothing respectfully. Validate that the SVG parses and scales '
+                            'correctly.',
+                  'artifact_extension': 'svg',
+                  'review_checklist': 'Recognizable likeness without reading the caption; original '
+                                      'vector shapes; clean scaling; valid SVG.',
+                  'max_tokens': 32000,
+                  'thinking': True,
+                  'reasoning_effort': 'medium',
+                  'subjects': ['Mahatma Gandhi',
+                               'Abraham Lincoln',
+                               'Mother Teresa',
+                               'Nelson Mandela'],
+                  'prompt_template': 'Create a recognizable, carefully composed vector portrait of '
+                                     '{figure} as a standalone artifact.svg. Draw the likeness '
+                                     'using original SVG paths and shapes; do not use embedded '
+                                     'raster images, external assets, scripts, or a generic face '
+                                     'with only a name label. Include a descriptive title and '
+                                     'description, a scalable viewBox, and a restrained color '
+                                     'palette. Capture distinctive facial features and clothing '
+                                     'respectfully. Validate that the SVG parses and scales '
+                                     'correctly.'},
+ 'kanban_board': {'name': 'Interactive Kanban board',
+                  'description': 'Create/edit/delete; drag and keyboard move; filtering; correct '
+                                 'counts; valid export/import round trip.',
+                  'prompt': 'Build a polished self-contained artifact.html for a Kanban board with '
+                            'To Do, In Progress, and Done columns. Support adding, editing, '
+                            'deleting, and moving cards; priorities; text search; and live column '
+                            'counts. Provide both drag-and-drop and keyboard-accessible move '
+                            'controls. Include JSON export/import with validation so data survives '
+                            'through exported files, without relying on browser storage. Include '
+                            'sample cards and empty states. Use no external dependencies. Test '
+                            'card moves, filtering, and export/import round trips.',
+                  'artifact_extension': 'html',
+                  'review_checklist': 'Create/edit/delete; drag and keyboard move; filtering; '
+                                      'correct counts; valid export/import round trip.',
+                  'max_tokens': 32000,
+                  'thinking': True,
+                  'reasoning_effort': 'medium'},
+ 'csv_dashboard': {'name': 'CSV data dashboard',
+                   'description': 'Quoted CSV fields; invalid rows; correct revenue totals; '
+                                  'synchronized filters and charts; empty-state handling.',
+                   'prompt': 'Build a polished self-contained artifact.html that lets a user paste '
+                             'or upload CSV sales data and inspect a table, filters, and SVG '
+                             'charts. Include sample data with date, product, region, quantity, '
+                             'and unit_price. Correctly parse quoted commas and escaped quotes, '
+                             'reject malformed rows clearly, compute revenue, and update totals '
+                             'and charts together when filtered. Handle empty data, zero values, '
+                             'and invalid numbers. Use no external libraries or network calls. '
+                             'Test the parser and filtered totals.',
+                   'artifact_extension': 'html',
+                   'review_checklist': 'Quoted CSV fields; invalid rows; correct revenue totals; '
+                                       'synchronized filters and charts; empty-state handling.',
+                   'max_tokens': 32000,
+                   'thinking': True,
+                   'reasoning_effort': 'medium'},
+ 'pathfinding_visualizer': {'name': 'Pathfinding visualizer',
+                            'description': 'Both algorithms find shortest paths; no-path state; '
+                                           'pause/reset; accurate path length; responsive '
+                                           'controls.',
+                            'prompt': 'Build a polished self-contained artifact.html that '
+                                      'visualizes breadth-first search and A* on an editable grid '
+                                      'with unit movement cost and no diagonal steps. Let users '
+                                      'position start and goal, draw and erase walls, choose '
+                                      'algorithm and speed, run/pause/reset, and inspect visited '
+                                      'nodes and final path length. Keep start/goal valid and show '
+                                      'a clear no-path state. Use no external libraries. Test '
+                                      'shortest-path length on a known grid, unreachable targets, '
+                                      'and reset during animation.',
+                            'artifact_extension': 'html',
+                            'review_checklist': 'Both algorithms find shortest paths; no-path '
+                                                'state; pause/reset; accurate path length; '
+                                                'responsive controls.',
+                            'max_tokens': 32000,
+                            'thinking': True,
+                            'reasoning_effort': 'medium'}})
 
 
 def benchmark_busy() -> bool:
@@ -445,7 +547,7 @@ def omlx_models(force: bool = False) -> dict[str, dict[str, Any]]:
     if not force and time.time() - float(omlx_status_cache["updated_at"]) < 0.5:
         return omlx_status_cache["models"]
     try:
-        response = httpx.get(f"{OMLX_ADMIN}/api/models", timeout=2.0)
+        response = httpx.get(f"{OMLX_ADMIN}/api/models", timeout=2.0, headers=UPSTREAM_HEADERS)
         response.raise_for_status()
         models = {
             item["id"]: item for item in response.json().get("models", [])
@@ -474,12 +576,12 @@ def model_state() -> dict:
     return {
         route: {
             "model": RUNTIME_MODEL_IDS[route],
-            "endpoint": OMLX_UPSTREAM if route == "router" else MODEL_ENDPOINTS[route],
+            "endpoint": MODEL_ENDPOINTS[route],
             "running": bool(states.get(RUNTIME_MODEL_IDS[route], {}).get("loaded")),
             "loading": bool(states.get(RUNTIME_MODEL_IDS[route], {}).get("is_loading")),
             "runtime": "omlx",
         }
-        for route in ("router", "moe", "dense")
+        for route in ("moe", "dense")
     }
 
 
@@ -546,7 +648,7 @@ def routing_context(body: dict) -> str:
 
 
 def router_request_context(body: dict) -> list[dict[str, Any]]:
-    """Preserve standard message/tool structure within the judge context budget."""
+    """Preserve standard message/tool structure within the routing context budget."""
     selected: list[dict[str, Any]] = []
     remaining = ROUTER_CONTEXT_CHARS
     for message in reversed(body.get("messages") or []):
@@ -753,210 +855,81 @@ async def wait_for_backend_drain_before_routing(req_id: Optional[str]) -> None:
         await asyncio.sleep(0.1)
 
 
-async def ensure_router_loaded() -> None:
-    """Recover transparently when oMLX evicts the small judge for headroom."""
-    if pid_running("router"):
-        return
-    if not ROUTER_RELOAD_IF_EVICTED:
-        raise RuntimeError("Arch-Router is not loaded")
-    logger.warning("Judge model was evicted; reloading %s", ROUTER_MODEL)
-    timeout = httpx.Timeout(SWAP_TIMEOUT_SEC)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{OMLX_ADMIN}/api/models/{ROUTER_MODEL}/load")
-        response.raise_for_status()
+async def wait_for_model_transition(client, model_id: str, loaded: bool) -> dict:
+    """Admin unload may return HTTP 202 while activity drains."""
     deadline = time.monotonic() + SWAP_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        invalidate_omlx_status()
-        if pid_running("router"):
-            logger.info("Judge model reloaded: %s", ROUTER_MODEL)
-            return
-        await asyncio.sleep(0.25)
-    raise TimeoutError(f"Timed out reloading judge model {ROUTER_MODEL}")
-
-
-ARCH_ROUTES = [
-    {
-        "name": str((ROUTE_CONFIG.get(route) or {}).get("judge_name", route)),
-        "description": str((ROUTE_CONFIG.get(route) or {}).get("description", "")),
-    }
-    for route in ("moe", "dense")
-]
-JUDGE_ROUTE_NAMES = {
-    str((ROUTE_CONFIG.get(route) or {}).get("judge_name", route)): route
-    for route in ("moe", "dense")
-}
-
-
-def requires_strict_structured_output(body: dict) -> bool:
-    response_format = body.get("response_format") or {}
-    response_type = str(response_format.get("type", "")).lower()
-    structured = body.get("structured_outputs")
-    return response_type in ("json_object", "json_schema") or bool(structured)
-
-
-async def arch_router_policy(
-    body: dict, req_id: Optional[str] = None
-) -> tuple[dict, float]:
-    """Use the judge for every non-explicit inference request, without affinity."""
-    started = now_ms()
-    fallback = normalize_policy({
-        "route": FALLBACK_ROUTE,
-        "confidence": 0.0,
-        "reason": f"configured fallback route: {FALLBACK_ROUTE}",
-        "task_type": "router_fallback",
-    }, heuristic_policy(body))
-    if not ROUTING_ENABLED:
-        return fallback, now_ms() - started
-
-    try:
-        async with router_transition_lock:
-            # Do not compete with or transition around a live stream/tool turn.
-            await wait_for_backend_drain_before_routing(req_id)
-            await ensure_router_loaded()
-            conversation = router_request_context(body)
-            states = model_state()
-            runtime_state = {
-                route: {
-                    "resident": bool(states[route]["running"]),
-                    "switch_required": not bool(states[route]["running"]),
-                }
-                for route in ("moe", "dense")
-            }
-            prompt = (
-                "Select the best model route for the NEXT assistant completion represented by "
-                "the complete OpenAI-style request below. Evaluate the unresolved objective, "
-                "message roles, tool calls, tool results, and requested output—not the identity "
-                "of the calling application. The resident model is a preference, not a mandate. "
-                "Keep it when candidates are similarly capable, but switch when another route "
-                "offers a meaningful quality or capability advantage.\n"
-                f"<routes>\n{json.dumps(ARCH_ROUTES)}\n</routes>\n"
-                f"<runtime_state>\n{json.dumps(runtime_state)}\n</runtime_state>\n"
-                f"<conversation>\n{json.dumps(conversation)}\n</conversation>\n"
-                "Select the route that best matches the latest user request. Return only the "
-                "exact route name from the supplied routes."
+    while True:
+        response = await client.get(f"{OMLX_ADMIN}/api/models")
+        response.raise_for_status()
+        states = {item["id"]: item for item in response.json()["models"]}
+        omlx_status_cache.update({"updated_at": time.time(), "models": states})
+        entry = states.get(model_id)
+        if entry is None:
+            raise RuntimeError(f"oMLX model disappeared during transition: {model_id}")
+        if bool(entry.get("loaded")) == loaded and not entry.get("is_loading"):
+            return states
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {model_id} loaded={loaded}; "
+                f"loaded={entry.get('loaded')}, is_loading={entry.get('is_loading')}"
             )
-            request_body = {
-                "model": ROUTER_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": ROUTER_MAX_TOKENS,
-                "temperature": ROUTER_TEMPERATURE,
-                "chat_template_kwargs": {"enable_thinking": ROUTER_THINKING},
-                "stream": False,
-            }
-            timeout = httpx.Timeout(ROUTER_TIMEOUT_SEC)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{OMLX_UPSTREAM}/v1/chat/completions", json=request_body
-                )
-                response.raise_for_status()
-                payload = response.json()
-        message = (payload.get("choices") or [{}])[0].get("message") or {}
-        raw = str(message.get("content") or "").strip()
-        route_pattern = "|".join(
-            re.escape(name) for name in sorted(JUDGE_ROUTE_NAMES, key=len, reverse=True)
-        )
-        match = re.search(rf"\b({route_pattern})\b", raw)
-        if not match:
-            raise ValueError(f"Arch-Router returned no valid route: {raw[:120]}")
-        arch_route = match.group(1)
-        route = JUDGE_ROUTE_NAMES[arch_route]
-        decision = {
-            "route": route,
-            "confidence": 0.85,
-            "reason": f"Arch-Router selected {arch_route}",
-        }
-        policy = normalize_policy(decision, fallback)
-        return policy, now_ms() - started
-    except Exception as exc:
-        fallback["reason"] = f"Arch-Router fallback ({type(exc).__name__}); {fallback['reason']}"
-        return fallback, now_ms() - started
+        await asyncio.sleep(0.25)
 
 
 async def ensure_route(route: str) -> float:
-    if pid_running(route):
-        return 0.0
-    command = "dense-on" if route == "dense" else "moe-on"
+    """Ensure the requested backend is loaded; retain both by default.
+
+    Query fresh state and fail closed on admin errors. Never use the old
+    stack script, whose ports and model IDs may describe a different machine.
+    """
+    if route not in MODEL_IDS:
+        raise ValueError(f"Unknown route: {route}")
     started = now_ms()
+    changed = False
     async with swap_lock:
-        if pid_running(route):
-            return now_ms() - started
-        try:
-            child_env = os.environ.copy()
-            child_env["GATEWAY_SAFE_TRANSITION"] = "1"
-            await asyncio.to_thread(
-                subprocess.run,
-                [STACK_SCRIPT, command],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=SWAP_TIMEOUT_SEC,
-                env=child_env,
-            )
-            invalidate_omlx_status()
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or str(exc))[-1000:]
-            raise RuntimeError(f"model switch failed: {detail}") from exc
-    return now_ms() - started
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(SWAP_TIMEOUT_SEC), headers=UPSTREAM_HEADERS
+        ) as client:
+            response = await client.get(f"{OMLX_ADMIN}/api/models")
+            response.raise_for_status()
+            states = {item["id"]: item for item in response.json()["models"]}
+            target = MODEL_IDS[route]
+            if target not in states:
+                raise RuntimeError(f"oMLX has not discovered model {target}")
+            other = MODEL_IDS["dense" if route == "moe" else "moe"]
+            if any(states.get(mid, {}).get("is_loading") for mid in (target, other)):
+                raise RuntimeError("A backend is already loading; retry after it finishes")
+            if not KEEP_MODELS_LOADED and states.get(other, {}).get("loaded"):
+                response = await client.post(f"{OMLX_ADMIN}/api/models/{other}/unload")
+                response.raise_for_status()
+                changed = True
+                states = await wait_for_model_transition(client, other, loaded=False)
+            if not states[target].get("loaded"):
+                response = await client.post(f"{OMLX_ADMIN}/api/models/{target}/load")
+                response.raise_for_status()
+                changed = True
+            states = await wait_for_model_transition(client, target, loaded=True)
+            if not KEEP_MODELS_LOADED and states.get(other, {}).get("loaded"):
+                raise RuntimeError(f"Other backend became loaded during transition: {other}")
+    return now_ms() - started if changed else 0.0
 
 
 async def prepare_backend(route: str, reason: str) -> tuple[str, str, float]:
-    try:
-        return route, reason, await ensure_route(route)
-    except Exception as exc:
-        if route != "dense":
-            raise
-        fallback_reason = f"dense unavailable ({type(exc).__name__}); fell back to MoE"
-        return "moe", f"{reason}; {fallback_reason}", await ensure_route("moe")
+    return route, reason, await ensure_route(route)
 
 
-async def choose_policy(
-    body: dict, req_id: Optional[str] = None
-) -> tuple[dict, float]:
-    requested = str(body.get("model", ""))
-    explicit = MODEL_ROUTES.get(requested)
-    if explicit in ("moe", "dense"):
-        thinking = bool((body.get("chat_template_kwargs") or {}).get("enable_thinking", True))
-        effort = "high" if thinking else "fast"
-        return normalize_policy({
-            "route": explicit, "confidence": 1.0, "reason": "explicit model selection",
-            "task_type": "explicit", "effort": effort, "thinking": thinking,
-            "max_tokens": body.get("max_tokens", EFFORT_TOKENS[effort]),
-        }), 0.0
-    latest_user = task_state(body)["latest_user"].lower()
-    explicit_dense_phrases = (
-        "use dense", "use the dense", "route to dense", "send to dense",
-        "handle this with dense", "run this with dense", "using the dense model",
-    )
-    if any(phrase in latest_user for phrase in explicit_dense_phrases):
-        return normalize_policy({
-            "route": "dense", "confidence": 1.0,
-            "reason": "explicit dense instruction in the current request",
-            "task_type": "explicit", "effort": "high", "thinking": True,
-            "max_tokens": EFFORT_TOKENS["high"],
-        }), 0.0
-    explicit_moe_phrases = (
-        "use moe", "use the moe", "route to moe", "send to moe",
-        "handle this with moe", "run this with moe", "using the moe model",
-    )
-    if any(phrase in latest_user for phrase in explicit_moe_phrases):
-        return normalize_policy({
-            "route": "moe", "confidence": 1.0,
-            "reason": "explicit MoE instruction in the current request",
-            "task_type": "explicit",
-        }), 0.0
-    if requested not in AUTO_MODEL_ALIASES and requested:
-        policy = normalize_policy({
-            "route": FALLBACK_ROUTE, "confidence": 0.0,
-            "reason": f"unknown model alias; configured fallback route: {FALLBACK_ROUTE}",
-            "task_type": "router_fallback",
-        }, heuristic_policy(body))
-        return policy, 0.0
-    return await arch_router_policy(body, req_id)
+async def choose_policy(body: dict, req_id: Optional[str] = None) -> tuple[dict, float]:
+    started = now_ms()
+    decision = ROUTING_ENGINE.route(body, explicit=MODEL_ROUTES.get(str(body.get("model", ""))))
+    policy = normalize_policy({**decision, "confidence": 1.0,
+                               "task_type": "deterministic", "thinking": True})
+    policy.update(decision)
+    return policy, now_ms() - started
 
 
 def apply_request_policy(body: dict, policy: dict, automatic: bool) -> dict:
     """Forward the client request unchanged except for the selected backend ID."""
-    routed = dict(body)
+    routed = strip_routing_controls(body)
     routed["model"] = MODEL_IDS[policy["route"]]
     return routed
 
@@ -977,9 +950,9 @@ async def wait_for_memory(req_id: str, planned_route: str = ""):
     while True:
         update_memory_state()
 
-        # A dense transition will first stop the resident MoE, releasing memory.
+        # Either transition first unloads the other large backend, releasing memory.
         # Do not deadlock by waiting for that memory before allowing the swap.
-        if planned_route == "dense" and pid_running("moe") and not pid_running("dense"):
+        if not KEEP_MODELS_LOADED and planned_route in MODEL_IDS and pid_running("dense" if planned_route == "moe" else "moe"):
             return now_ms() - waited_start
 
         async with lock:
@@ -1028,6 +1001,12 @@ async def memory_watcher():
 async def startup():
     update_memory_state()
     load_benchmarks()
+    if KEEP_MODELS_LOADED:
+        for route in MODEL_IDS:
+            await ensure_route(route)
+        states = omlx_models(force=True)
+        if not all(states.get(mid, {}).get("loaded") for mid in MODEL_IDS.values()):
+            raise RuntimeError("oMLX could not retain both models; check its memory limits")
     asyncio.create_task(memory_watcher())
 
 
@@ -1045,8 +1024,9 @@ async def health():
         "models": model_state(),
         "active_requests": len(active),
         "max_active_requests": MAX_ACTIVE_REQUESTS,
+        "keep_models_loaded": KEEP_MODELS_LOADED,
         "memory": memory_state,
-        "routing_mode": "stateless semantic routing; every automatic request is judged",
+        "routing_mode": "deterministic complexity lookup; code above level 4 uses dense",
         "router_config": ROUTER_CONFIG_PATH,
     }
 
@@ -1072,6 +1052,7 @@ async def metrics():
                 "routing_enabled": ROUTING_ENABLED,
                 "auto_model_aliases": sorted(AUTO_MODEL_ALIASES),
                 "max_active_requests": MAX_ACTIVE_REQUESTS,
+        "keep_models_loaded": KEEP_MODELS_LOADED,
                 "memory_guard_gb": MEMORY_GUARD_GB,
                 "memory_hard_gb": MEMORY_HARD_GB,
                 "queue_on_memory_pressure": QUEUE_ON_MEMORY_PRESSURE,
@@ -1079,10 +1060,12 @@ async def metrics():
                 "router_context_chars": ROUTER_CONTEXT_CHARS,
                 "manual_dense_pin_sec": 0,
                 "idle_baseline_quiet_sec": None,
-                "routing_mode": "stateless semantic routing; every automatic request is judged",
+                "routing_mode": "deterministic complexity lookup; code above level 4 uses dense",
                 "router_config": ROUTER_CONFIG_PATH,
                 "fallback_route": FALLBACK_ROUTE,
-                "judge_model": ROUTER_MODEL,
+                "judge_model": None,
+                "routing_rules_version": ROUTING_ENGINE.rules["version"],
+                "routing_rules_error": ROUTING_ENGINE.last_error,
             },
             "benchmarks": {
                 "jobs": list(benchmark_jobs.values()),
@@ -1124,7 +1107,29 @@ async def clear_cache():
 
 @app.post("/control/affinity/clear")
 async def clear_affinity():
-    return {"ok": True, "removed": 0, "message": "Affinity is disabled; routing is stateless."}
+    async with lock:
+        if active or benchmark_busy():
+            return JSONResponse({"error": "gateway is busy"}, status_code=409)
+        removed = len(ROUTING_ENGINE.tasks)
+        ROUTING_ENGINE.tasks.clear()
+    return {"ok": True, "removed": removed}
+
+
+@app.get("/routing/rules")
+async def routing_rules():
+    return {"rules": ROUTING_ENGINE.rules, "error": ROUTING_ENGINE.last_error}
+
+
+@app.put("/routing/rules")
+async def update_routing_rules(request: Request):
+    if active or benchmark_busy():
+        return JSONResponse({"error": "gateway is busy"}, status_code=409)
+    try:
+        ROUTING_ENGINE.update_rules(await request.json())
+    except (ValueError, KeyError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    response_cache.clear()
+    return {"ok": True, "version": ROUTING_ENGINE.rules["version"]}
 
 
 @app.get("/benchmarks")
@@ -1141,7 +1146,7 @@ def benchmark_result(result_id: str) -> Optional[dict]:
 
 
 def extract_html_artifact(response: str) -> str:
-    fenced = re.search(r"```(?:html)?\s*(.*?)```", response, re.IGNORECASE | re.DOTALL)
+    fenced = re.search(r"```(?:html|svg)?\s*(.*?)```", response, re.IGNORECASE | re.DOTALL)
     html = fenced.group(1).strip() if fenced else response.strip()
     if not re.search(r"<!doctype\s+html|<html\b", html, re.IGNORECASE):
         raise ValueError("The model response does not contain an HTML document")
@@ -1151,14 +1156,25 @@ def extract_html_artifact(response: str) -> str:
 @app.get("/benchmarks/artifact/{result_id}", response_class=HTMLResponse)
 async def benchmark_artifact(result_id: str):
     result = benchmark_result(result_id)
-    if not result or result.get("suite") != "coding_hitl":
+    if not result or not BENCHMARK_SUITES.get(result.get("suite"), {}).get("artifact_extension"):
         return HTMLResponse("Benchmark artifact not found", status_code=404)
     try:
-        html = extract_html_artifact(str(result.get("response", "")))
+        if BENCHMARK_SUITES[result["suite"]].get("artifact_extension") == "svg":
+            import xml.etree.ElementTree as ET
+            html = str(result.get("response", ""))
+            try:
+                element = ET.fromstring(html)
+                if element.tag.split("}")[-1] != "svg":
+                    raise ValueError("Expected an SVG document")
+            except ET.ParseError as exc:
+                raise ValueError("Invalid SVG document") from exc
+        else:
+            html = extract_html_artifact(str(result.get("response", "")))
     except ValueError as exc:
         return HTMLResponse(str(exc), status_code=422)
     return HTMLResponse(
         html,
+        media_type="image/svg+xml" if BENCHMARK_SUITES[result["suite"]].get("artifact_extension") == "svg" else "text/html",
         headers={
             "Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src data:",
             "Referrer-Policy": "no-referrer",
@@ -1189,6 +1205,12 @@ async def save_benchmark_verdict(result_id: str, request: Request):
         "recorded_at": time.time(),
     }
     save_benchmarks()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "routing-feedback.jsonl"), "a") as journal:
+        journal.write(json.dumps({"result_id": result_id, "suite": result.get("suite"),
+            "route": result.get("route"), "prompt_hash": result.get("prompt_hash"),
+            "rules_version": ROUTING_ENGINE.rules["version"],
+            "verdict": result["human_verdict"]}) + "\n")
     return {"ok": True, "human_verdict": result["human_verdict"]}
 
 
@@ -1277,6 +1299,14 @@ def evaluate_benchmark_output(suite_id: str, response: str, finish_reason: str,
             rubric_check("Contains input validation", any(term in lowered for term in ("isnan", "isfinite", "invalid", "required", "min=")), "Static validation evidence", 2),
             rubric_check("Addresses currency rounding", any(term in lowered for term in ("math.round", "tofixed", "cents", "round")), "Static rounding evidence", 2),
         ]
+    elif BENCHMARK_SUITES.get(suite_id, {}).get("artifact_extension"):
+        extension = BENCHMARK_SUITES[suite_id]["artifact_extension"]
+        instruction = [rubric_check("Expected artifact document", bool(re.search(
+            r"<svg\b" if extension == "svg" else r"<!doctype\s+html|<html\b", text, re.I)),
+            "Structural evidence only; functional behavior and likeness require human review", 3)]
+        correctness = [rubric_check("Self-contained asset", not re.search(
+            r'(?:src|href)=[\"\']https?://', text, re.I),
+            "No external asset URLs detected; review against the task checklist", 1)]
     else:
         required_terms = {
             "States assumptions": "assumption" in lowered,
@@ -1338,7 +1368,7 @@ async def benchmark_infer(route: str, body: dict) -> tuple[int, float, Optional[
     body = dict(body)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=None, headers=UPSTREAM_HEADERS) as client:
         async with client.stream(
             "POST", f"{MODEL_ENDPOINTS[route]}/v1/chat/completions", json=body
         ) as response:
@@ -1395,16 +1425,17 @@ def pi_message_text(message: dict) -> tuple[str, str]:
 
 
 def find_benchmark_artifact(workspace: str, suite_id: str) -> Optional[str]:
-    if suite_id != "coding_hitl":
+    extension = BENCHMARK_SUITES.get(suite_id, {}).get("artifact_extension")
+    if not extension:
         return None
-    preferred = os.path.join(workspace, "artifact.html")
+    preferred = os.path.join(workspace, f"artifact.{extension}")
     if os.path.isfile(preferred):
         return preferred
     candidates: list[str] = []
     for root, dirs, files in os.walk(workspace):
         dirs[:] = [d for d in dirs if d not in ("sessions", ".git", "node_modules")]
         candidates.extend(
-            os.path.join(root, name) for name in files if name.lower().endswith(".html")
+            os.path.join(root, name) for name in files if name.lower().endswith("." + extension)
         )
     return max(candidates, key=os.path.getsize) if candidates else None
 
@@ -1444,6 +1475,19 @@ def describe_pi_event(event: dict) -> Optional[tuple[str, str]]:
     return None
 
 
+def benchmark_generation_stats(metrics: list[dict]) -> dict:
+    """Time-weighted generation rate across every call, never a mean of rates."""
+    if not metrics or any(
+        m.get("completion_tokens") is None or m.get("generation_ms") is None
+        or m["generation_ms"] <= 0 for m in metrics
+    ):
+        return {"average_tps": None, "generation_ms": None}
+    tokens = sum(m["completion_tokens"] for m in metrics)
+    duration = sum(m["generation_ms"] for m in metrics)
+    return {"average_tps": round(tokens * 1000 / duration, 2),
+            "generation_ms": round(duration, 1)}
+
+
 async def run_pi_benchmark(route: str, suite_id: str, prompt: str, workspace: str,
                            reasoning_effort: str, job: dict) -> dict:
     """Run a complete isolated Pi agent session and capture its JSON event stream."""
@@ -1455,14 +1499,15 @@ async def run_pi_benchmark(route: str, suite_id: str, prompt: str, workspace: st
         "directory. Complete the user's task fully rather than merely describing a plan. "
         "Use your normal coding-agent tools when useful."
     )
-    if suite_id == "coding_hitl":
+    extension = BENCHMARK_SUITES.get(suite_id, {}).get("artifact_extension")
+    if extension:
         system_note += (
-            " Create the complete, self-contained solution as artifact.html. Validate its "
-            "basic JavaScript behavior locally before finishing."
+            f" Create the complete, self-contained solution as artifact.{extension}. "
+            "Validate the artifact locally before finishing."
         )
     command = [
         PI_EXECUTABLE, "--mode", "json", "--print", "--no-session", "--approve",
-        "--provider", "local-mlx", "--model", alias,
+        "--provider", "mlx-proxy", "--model", alias,
         "--thinking", reasoning_effort if reasoning_effort in
         ("off", "minimal", "low", "medium", "high", "xhigh", "max") else "medium",
         "--append-system-prompt", system_note, prompt,
@@ -1621,6 +1666,7 @@ async def run_pi_benchmark(route: str, suite_id: str, prompt: str, workspace: st
         "total_tokens": (model_prompt_tokens + model_completion_tokens) or
                         (pi_input_tokens + pi_output_tokens),
         "cached_tokens": pi_cache_read,
+        **benchmark_generation_stats(matching_metrics),
         "model_latency_ms": model_latency_ms,
         "model_requests": len(matching_metrics),
         "response": artifact_html or final_answer,
@@ -1711,12 +1757,15 @@ async def run_benchmark(job_id: str, suite_id: str, routes: list[str], max_token
                         "model_ready_at": ready_at,
                         "inference_started_at": inference_started_at,
                         "inference_finished_at": inference_finished_at,
+                        "total_time_ms": round(swap_ms + latency_ms, 1),
+                        "average_tps": pi_run["average_tps"],
+                        "generation_ms": pi_run["generation_ms"],
+                        "end_to_end_tps": round(completion * 1000 / latency_ms, 2) if latency_ms > 0 else None,
                         "swap_ms": round(swap_ms, 1), "latency_ms": round(latency_ms, 1),
                         "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
                         "prompt_tokens": pi_run["prompt_tokens"],
                         "completion_tokens": completion, "total_tokens": pi_run["total_tokens"],
-                        "gen_tps": round(completion / (max(1.0, latency_ms - (ttft_ms or 0.0)) / 1000.0), 2)
-                        if completion and latency_ms > 0 else None,
+                        "gen_tps": pi_run["average_tps"],
                         "finish_reason": finish_reason,
                         "available_before_gb": round(before.available / 1024 ** 3, 2),
                         "available_after_gb": round(after.available / 1024 ** 3, 2),
@@ -1987,7 +2036,7 @@ async def proxy_nonstream(
             async with lock:
                 if req_id in active:
                     active[req_id].update({"model": MODEL_IDS[route], "route": route, "route_reason": route_reason, "swap_ms": swap_ms})
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=None, headers=UPSTREAM_HEADERS) as client:
                 r = await client.post(
                     f"{MODEL_ENDPOINTS[route]}/v1/chat/completions",
                     json=routed_body,
@@ -2089,6 +2138,7 @@ async def stream_request(
             async with lock:
                 if req_id in active:
                     active[req_id].update({"model": MODEL_IDS[route], "route": route, "route_reason": route_reason, "swap_ms": swap_ms})
+            generation_dispatch = now_ms()
             async for chunk in stream_upstream(body, req_id, route):
                 kind, value = chunk
                 if kind == "meta":
@@ -2103,8 +2153,9 @@ async def stream_request(
         total_tokens = usage.get("total_tokens")
         cached_tokens = usage.get("cached_tokens")
 
-        generation_ms = elapsed - ttft_ms if ttft_ms is not None and elapsed >= ttft_ms else elapsed
-        gen_tps = completion_tokens / (generation_ms / 1000) if completion_tokens and generation_ms > 0 else None
+        dispatch_ms = now_ms() - generation_dispatch
+        generation_ms = max(0.0, dispatch_ms - ttft_ms) if ttft_ms is not None else None
+        gen_tps = completion_tokens / (generation_ms / 1000) if completion_tokens and generation_ms is not None and generation_ms > 0 else None
         update_memory_state()
         await record(Metric(
             id=req_id, ts=time.time(), model=MODEL_IDS[route], requested_model=requested_model,
@@ -2153,7 +2204,7 @@ async def stream_upstream(body: dict, req_id: str, route: str):
     low_memory_events = 0
     timeout = httpx.Timeout(None)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=UPSTREAM_HEADERS) as client:
         async with client.stream(
             "POST",
             f"{MODEL_ENDPOINTS[route]}/v1/chat/completions",
@@ -2425,42 +2476,42 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0c1015;border:1px sol
 </div>
 <div class=tab id=routing>
  <div class=grid><div class=card><div class=k>Exact-cache entries</div><div class=v id=cacheEntries>0</div></div><div class=card><div class=k>Cache hits</div><div class=v id=cacheHits>0</div></div><div class=card><div class=k>Route affinity</div><div class=v id=pins>OFF</div></div><div class=card><div class=k>Idle model swapping</div><div class=v id=manualPin>OFF</div></div><div class=card><div class=k>Routing</div><div class=v id=routingState>—</div></div></div>
- <section><h2>Backend controls</h2><div class=notice>Every automatic request is evaluated by the configured judge using recent message and tool context plus current runtime state. No client identity, session affinity, route timers, or idle switching are used. Explicit model selections still bypass the judge.</div><div class=actions><button class="action primary" onclick="switchModel('moe')">Activate MoE</button><button class="action primary" onclick="switchModel('dense')">Activate dense</button><button class="action danger" onclick="post('/control/cache/clear','Cache cleared')">Clear exact cache</button></div><div id=controlMsg class=muted></div></section>
+ <section><h2>Backend controls</h2><div class=notice>Every automatic request is scored by the deterministic routing engine (routing_rules.json): code above complexity level 4 uses dense, everything else uses the MoE workhorse. No client identity, session affinity, route timers, or idle switching are used. Explicit model selections and [model:...] / [complexity:...] controls override the lookup.</div><div class=actions><button class="action primary" onclick="switchModel('moe')">Activate MoE</button><button class="action primary" onclick="switchModel('dense')">Activate dense</button><button class="action danger" onclick="post('/control/cache/clear','Cache cleared')">Clear exact cache</button></div><div id=controlMsg class=muted></div></section>
  <section><h2>Routing decisions</h2><table><thead><tr><th>Time</th><th>Route</th><th>Profile</th><th>Confidence</th><th>Reason</th><th>Router time</th><th>Cache</th></tr></thead><tbody id=routeRows></tbody></table></section>
 </div>
 <div class=tab id=benchmarks>
- <div class=card><div class=suite><div><h2>Run a real Pi agent comparison</h2><div class=muted>Each model receives the same prompt in a fresh isolated Pi coding-agent session. Pi may reason, use tools, create files, and validate its work. Models run sequentially and the previous backend is restored.</div></div><button class="action primary" id=runBench onclick=runBenchmark()>Run benchmark</button></div><div class=actions><select id=suite onchange=showPrompt()></select><label><input type=checkbox id=bmoe checked> MoE</label><label><input type=checkbox id=bdense checked> Dense</label><span class=muted>132K context · up to 32,144 output tokens</span><button class=action onclick=resetPrompt()>Reset standard prompt</button><button class="action danger" onclick=clearBenchmarkHistory()>Clear benchmark history</button></div><div class=muted id=profileHint>Editable prompt sent identically to each selected model through Pi.</div><textarea id=promptEditor aria-label="Benchmark prompt"></textarea><div id=benchMsg class=muted></div></div>
+ <div class=card><div class=suite><div><h2>Run a real Pi agent comparison</h2><div class=muted>Each model receives the same prompt in a fresh isolated Pi coding-agent session. Pi may reason, use tools, create files, and validate its work. Models run sequentially and the previous backend is restored.</div></div><button class="action primary" id=runBench onclick=runBenchmark()>Run benchmark</button></div><div class=actions><select id=suite onchange=showPrompt()></select><label id=portraitLabel style="display:none">Portrait subject <select id=portraitSubject onchange=showPrompt()></select></label><label><input type=checkbox id=bmoe checked> MoE</label><label><input type=checkbox id=bdense checked> Dense</label><span class=muted>128K context · up to 32,000 output tokens</span><button class=action onclick=resetPrompt()>Reset standard prompt</button><button class="action danger" onclick=clearBenchmarkHistory()>Clear benchmark history</button></div><div class=muted id=profileHint>Editable prompt sent identically to each selected model through Pi.</div><textarea id=promptEditor aria-label="Benchmark prompt"></textarea><div id=benchMsg class=muted></div></div>
  <section><h2>Live Pi activity</h2><div class=muted>The exact prompt and Pi's agent/tool activity appear here while the benchmark runs. Secrets are redacted and long payloads are shortened.</div><pre class=output id=liveBenchLog style="max-height:360px">No benchmark activity yet.</pre></section>
  <section><h2>Current and recent jobs</h2><table><thead><tr><th>Created</th><th>Suite</th><th>Routes</th><th>Status</th><th>Lifecycle stage</th><th>Error</th></tr></thead><tbody id=jobRows></tbody></table></section>
  <section><div class=comparehead><div><h2>Output Comparison Workspace</h2><div class=muted>Persistent side-by-side evidence for one benchmark run.</div></div><select id=compareJob onchange="selectComparison(this.value)"><option value="">Choose a completed run</option></select></div><div id=compareEmpty class=notice>Select a completed benchmark run to compare its model outputs.</div><div id=compareGrid class=comparegrid style="display:none"><div class=card><div class=k>Output A</div><div class=v id=compareATitle>—</div><div class=meta id=compareAMeta></div><div id=compareAEval></div><pre class=output id=compareA></pre><div id=compareAHitl></div></div><div class=card><div class=k>Output B</div><div class=v id=compareBTitle>—</div><div class=meta id=compareBMeta></div><div id=compareBEval></div><pre class=output id=compareB></pre><div id=compareBHitl></div></div></div><div id=comparePromptWrap style="display:none"><h3>Exact shared prompt</h3><pre id=comparePrompt></pre><div class=notice>Readiness is an evidence-backed rubric for this response, not a claim of global model accuracy.</div></div></section>
- <section><h2>Results</h2><table><thead><tr><th>Time</th><th>Suite</th><th>Route</th><th>Model</th><th>Readiness</th><th>Evidence</th><th>Load/readiness</th><th>TTFT</th><th>Pi end-to-end</th><th>Prompt tokens</th><th>Completion</th><th>Tok/s</th><th>Available before → after</th><th>Swap written</th><th>Compute</th></tr></thead><tbody id=benchRows></tbody></table></section>
+ <section><h2>Results</h2><p class=muted>Total time includes loading and the full Pi run. Tool calls count all executed tools, including retries. Average generation TPS = total output tokens / summed generation time across model calls; excludes tool execution and per-call time to first token. Older runs without generation timing show —.</p><table><thead><tr><th>Time</th><th>Suite</th><th>Route</th><th>Model</th><th>Readiness</th><th>Evidence</th><th>Load/readiness</th><th>TTFT</th><th>Total time incl. load</th><th>Pi run time</th><th>Tool calls</th><th>Model calls</th><th>Prompt tokens</th><th>Completion</th><th>Average generation TPS</th><th>Available before → after</th><th>Swap written</th><th>Compute</th></tr></thead><tbody id=benchRows></tbody></table></section>
 </div></main>
 <script>
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),sec=x=>x==null?'—':(x/1000).toFixed(2)+'s',val=(x,d='—')=>x==null?d:x;
-let suiteData={},benchmarkResults=[],benchmarkJobs=[],selectedCompareJob='',verdictDrafts={};function showPrompt(){const x=suiteData[$('suite').value];if(x){$('promptEditor').value=x.prompt;$('profileHint').textContent=`Pi agent profile: thinking ${x.thinking?'on':'off'} · reasoning ${x.reasoning_effort} · 132K context · up to 32,144 output tokens. The prompt and environment are identical for each selected model.`}}function resetPrompt(){showPrompt();$('benchMsg').textContent='Standard prompt restored.'}
+let suiteData={},benchmarkResults=[],benchmarkJobs=[],selectedCompareJob='',verdictDrafts={};function showPrompt(){const x=suiteData[$('suite').value];if(x){const subjects=x.subjects||[];$('portraitLabel').style.display=subjects.length?'':'none';if(subjects.length&&!$('portraitSubject').options.length){$('portraitSubject').innerHTML=subjects.map(name=>`<option>${esc(name)}</option>`).join('')}$('promptEditor').value=x.prompt_template?x.prompt_template.replace('{figure}',$('portraitSubject').value):x.prompt;$('profileHint').textContent=`Pi agent profile: thinking ${x.thinking?'on':'off'} · reasoning ${x.reasoning_effort} · 128K context · up to 32,000 output tokens. The prompt and environment are identical for each selected model.`}}function resetPrompt(){showPrompt();$('benchMsg').textContent='Standard prompt restored.'}
 function comparisonReady(jobId){const rows=benchmarkResults.filter(x=>x.job_id===jobId),job=benchmarkJobs.find(x=>x.id===jobId),expected=job?.routes||rows[0]?.requested_routes||[];return expected.length>=2&&expected.every(route=>rows.some(x=>x.route===route&&x.status>=200&&x.status<300))&&(!job||job.status==='complete')}
 function renderLivePi(jobs){const job=[...jobs].reverse().find(j=>['queued','running'].includes(j.status))||jobs[jobs.length-1],lines=job?.live_log||[];if(!lines.length){$('liveBenchLog').textContent='No benchmark activity yet.';return}const wasNearBottom=$('liveBenchLog').scrollHeight-$('liveBenchLog').scrollTop-$('liveBenchLog').clientHeight<45;$('liveBenchLog').textContent=lines.map(x=>`[${new Date(x.ts*1000).toLocaleTimeString()}] [${(x.route||'all').toUpperCase()}] ${x.kind}: ${x.message}`).join('\n');if(wasNearBottom)$('liveBenchLog').scrollTop=$('liveBenchLog').scrollHeight}
 function enforceComparisonLocks(){const ordered=benchmarkResults.slice().reverse();document.querySelectorAll('#benchRows button').forEach((button,index)=>{const ready=comparisonReady(ordered[index]?.job_id);button.disabled=!ready;button.textContent=ready?'Compare output':'Waiting for both models'});[...$('compareJob').options].slice(1).forEach(option=>{if(!comparisonReady(option.value))option.remove()});if(selectedCompareJob&&!comparisonReady(selectedCompareJob)){selectedCompareJob='';$('compareGrid').style.display='none';$('comparePromptWrap').style.display='none';$('compareEmpty').style.display='block'}}
 async function clearBenchmarkHistory(){if(!confirm('Clear all stored benchmark jobs and results?'))return;try{const r=await fetch('/benchmarks/clear',{method:'POST'}),d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);benchmarkResults=[];benchmarkJobs=[];selectedCompareJob='';$('benchMsg').textContent=`Cleared ${d.removed_results} results.`;await tick()}catch(e){$('benchMsg').textContent='Error: '+e.message}}
-function compareMeta(x){return x?`<span>TTFT ${sec(x.ttft_ms)}</span><span>Pi end-to-end ${sec(x.latency_ms)}</span><span>Model runtime ${sec(x.model_latency_ms)}</span><span>${val(x.pi_model_requests)} model calls</span><span>${val(x.pi_tool_calls)} tool calls · ${val(x.pi_tool_errors)} errors</span><span>${val(x.completion_tokens)} tokens</span><span>${val(x.gen_tps)} effective t/s</span><span>Compute ${val(x.compute_score)}</span>${x.validation?`<span>Functional validation ${esc(x.validation.runtime_status||x.validation.status)} · ${x.validation.passed}/${x.validation.total}</span>`:''}`:''}
+function compareMeta(x){return x?`<span>TTFT ${sec(x.ttft_ms)}</span><span><b>Total time ${sec(x.total_time_ms??(x.latency_ms==null?null:x.latency_ms+(x.swap_ms||0)))}</b></span><span>Pi run time ${sec(x.latency_ms)}</span><span>Model runtime ${sec(x.model_latency_ms)}</span><span>${val(x.pi_model_requests)} model calls</span><span>${val(x.pi_tool_calls)} tool calls · ${val(x.pi_tool_errors)} errors</span><span>${val(x.completion_tokens)} tokens</span><span><b>${val(x.average_tps)} average generation TPS</b></span><span>Compute ${val(x.compute_score)}</span>${x.validation?`<span>Functional validation ${esc(x.validation.runtime_status||x.validation.status)} · ${x.validation.passed}/${x.validation.total}</span>`:''}`:''}
 function capturedOutput(x){if(!x)return 'No model result.';if(x.response)return x.response;const reasoningChars=x.reasoning_chars??(x.reasoning?.length||0);if(reasoningChars)return `NO FINAL ANSWER EMITTED\n\nThe model used its output budget for ${reasoningChars.toLocaleString()} characters of reasoning and reached ${x.finish_reason||'an unknown finish state'} before producing final content. This is a benchmark failure, not a capture failure.`;if(x.parameters)return 'The model returned no final-answer content.';return 'Response was not captured by the gateway version used for this historical run.'}
 function evaluationHtml(x){const e=x?.evaluation;if(!e)return '<div class=notice>No evaluation was recorded for this earlier run.</div>';const cats=Object.entries(e.categories||{}).map(([name,c])=>`<div class=rubric><span>${esc(name.replaceAll('_',' '))}</span><b>${c.score}/100</b></div><ul class=checks>${(c.checks||[]).map(k=>`<li class=${k.passed?'pass':'fail'}>${k.passed?'PASS':'FAIL'} · ${esc(k.label)} — ${esc(k.detail)}</li>`).join('')}</ul>`).join('');const qualified=x.qualification?.qualified!==false;const headline=qualified?`${e.readiness_score}/100`:'DISQUALIFIED';const why=qualified?'':`<div class="notice bad">${(x.qualification?.reasons||[]).map(esc).join(' · ')}</div>`;return `<div class="score ${qualified?'':'bad'}">${headline}</div>${why}<div class=muted>Readiness · ${esc(e.method)} · confidence ${esc(e.confidence)}</div>${cats}`}
-function htmlFromResult(x){const raw=x?.response||'',m=raw.match(/```(?:html)?\s*([\s\S]*?)```/i);return (m?m[1]:raw).trim()}
-async function copyArtifact(id){const x=benchmarkResults.find(r=>r.id===id);if(!x)return;await navigator.clipboard.writeText(htmlFromResult(x));$('benchMsg').textContent='HTML copied to clipboard.'}
+function htmlFromResult(x){const raw=x?.response||'',m=raw.match(/```(?:html|svg)?\s*([\s\S]*?)```/i);return (m?m[1]:raw).trim()}
+async function copyArtifact(id){const x=benchmarkResults.find(r=>r.id===id);if(!x)return;await navigator.clipboard.writeText(htmlFromResult(x));$('benchMsg').textContent='Artifact copied to clipboard.'}
 function openArtifact(id){window.open('/benchmarks/artifact/'+encodeURIComponent(id),'_blank','noopener,noreferrer')}
 function rememberVerdict(id,field,value){verdictDrafts[id]={...(verdictDrafts[id]||{}),[field]:value}}
 function rememberNotes(id,value){verdictDrafts[id]={...(verdictDrafts[id]||{}),notes:value}}
-function hitlHtml(x){if(!x||x.suite!=='coding_hitl')return '';const h=x.human_verdict||{},d=verdictDrafts[x.id]||{},v=d.verdict??h.verdict??'',c=d.comparison??h.comparison??'',notes=d.notes??h.notes??'';const radio=(field,value,label,selected)=>`<label><input type=radio name="${field}-${x.id}" value="${value}" ${selected===value?'checked':''} onchange="rememberVerdict('${x.id}','${field}',this.value)"> ${label}</label>`;return `<div class=notice><b>Human evaluation</b><div class=actions><button class="action primary" onclick="openArtifact('${x.id}')">Open HTML</button><button class=action onclick="copyArtifact('${x.id}')">Copy HTML</button></div><div class=muted>Functional outcome</div><div class=verdicts>${radio('verdict','pass','Pass',v)}${radio('verdict','partial','Partial',v)}${radio('verdict','fail','Fail',v)}</div><div class=muted>Final product compared with the other model</div><div class=verdicts>${radio('comparison','better','Better than the other model',c)}${radio('comparison','similar','Similar',c)}${radio('comparison','worse','Worse than the other model',c)}</div><input id="notes-${x.id}" value="${esc(notes)}" oninput="rememberNotes('${x.id}',this.value)" placeholder="Optional test notes" style="width:100%"><div class=actions><button class=action onclick="saveVerdict('${x.id}')">Save evaluation</button></div><div class=muted>${h.recorded_at?'Saved '+new Date(h.recorded_at*1000).toLocaleString():'Open and test the exact generated artifact, then record the result.'}</div></div>`}
+function hitlHtml(x){if(!x||!suiteData[x.suite]?.artifact_extension)return '';const h=x.human_verdict||{},d=verdictDrafts[x.id]||{},v=d.verdict??h.verdict??'',c=d.comparison??h.comparison??'',notes=d.notes??h.notes??'';const radio=(field,value,label,selected)=>`<label><input type=radio name="${field}-${x.id}" value="${value}" ${selected===value?'checked':''} onchange="rememberVerdict('${x.id}','${field}',this.value)"> ${label}</label>`;return `<div class=notice><b>Human evaluation</b><p>${esc(suiteData[x.suite]?.review_checklist||'Test the generated artifact against the prompt.')}</p><div class=actions><button class="action primary" onclick="openArtifact('${x.id}')">Open artifact</button><button class=action onclick="copyArtifact('${x.id}')">Copy artifact</button></div><div class=muted>Functional outcome</div><div class=verdicts>${radio('verdict','pass','Pass',v)}${radio('verdict','partial','Partial',v)}${radio('verdict','fail','Fail',v)}</div><div class=muted>Final product compared with the other model</div><div class=verdicts>${radio('comparison','better','Better than the other model',c)}${radio('comparison','similar','Similar',c)}${radio('comparison','worse','Worse than the other model',c)}</div><input id="notes-${x.id}" value="${esc(notes)}" oninput="rememberNotes('${x.id}',this.value)" placeholder="Optional test notes" style="width:100%"><div class=actions><button class=action onclick="saveVerdict('${x.id}')">Save evaluation</button></div><div class=muted>${h.recorded_at?'Saved '+new Date(h.recorded_at*1000).toLocaleString():'Open and test the exact generated artifact, then record the result.'}</div></div>`}
 async function saveVerdict(id){const verdict=document.querySelector(`input[name="verdict-${id}"]:checked`)?.value||'',comparison=document.querySelector(`input[name="comparison-${id}"]:checked`)?.value||'',notes=$('notes-'+id).value;if(!verdict){$('benchMsg').textContent='Choose Pass, Partial, or Fail first.';return}const r=await fetch('/benchmarks/result/'+encodeURIComponent(id)+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verdict,comparison,notes})}),d=await r.json();if(!r.ok){$('benchMsg').textContent='Error: '+(d.error||r.statusText);return}delete verdictDrafts[id];$('benchMsg').textContent='Human evaluation saved.';await tick()}
 function selectComparison(jobId){if(jobId&&!comparisonReady(jobId))return;selectedCompareJob=jobId;$('compareJob').value=jobId;const rows=benchmarkResults.filter(x=>x.job_id===jobId);const a=rows.find(x=>x.route==='moe')||rows[0],b=rows.find(x=>x.route==='dense')||rows[1];if(!a){$('compareGrid').style.display='none';$('comparePromptWrap').style.display='none';$('compareEmpty').style.display='block';return}$('compareEmpty').style.display='none';$('compareGrid').style.display='grid';$('comparePromptWrap').style.display='block';$('compareATitle').textContent=(a.route||'A').toUpperCase();$('compareAMeta').innerHTML=compareMeta(a);$('compareAEval').innerHTML=evaluationHtml(a);$('compareA').textContent=capturedOutput(a);$('compareAHitl').innerHTML=hitlHtml(a);$('compareBTitle').textContent=b?(b.route||'B').toUpperCase():'No second model';$('compareBMeta').innerHTML=compareMeta(b);$('compareBEval').innerHTML=b?evaluationHtml(b):'<div class=notice>No second model result.</div>';$('compareB').textContent=b?capturedOutput(b):'Run the benchmark with both MoE and dense selected.';$('compareBHitl').innerHTML=b?hitlHtml(b):'';$('comparePrompt').textContent=a.prompt||b?.prompt||'Prompt was not captured by the gateway version used for this run.'}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button,.tab').forEach(x=>x.classList.remove('on'));b.classList.add('on');$(b.dataset.tab).classList.add('on')});
 async function post(url,msg,body){try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);$('controlMsg').textContent=msg||'Done';await tick();return d}catch(e){$('controlMsg').textContent='Error: '+e.message;throw e}}
 async function switchModel(route){await post('/control/model/'+route,route.toUpperCase()+' is active and remains resident until another route is needed.')}
 async function runBenchmark(){const routes=[];if($('bmoe').checked)routes.push('moe');if($('bdense').checked)routes.push('dense');if(!routes.length){$('benchMsg').textContent='Select at least one model.';return}const prompt=$('promptEditor').value.trim();if(!prompt){$('benchMsg').textContent='Prompt cannot be empty.';return}$('runBench').disabled=true;try{const r=await fetch('/benchmarks/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({suite:$('suite').value,routes,prompt})});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);$('benchMsg').textContent=`Pi benchmark queued using ${d.prompt_mode} prompt ${d.prompt_hash.slice(0,8)}. Other gateway clients will be held out until both agent runs finish.`}catch(e){$('benchMsg').textContent='Error: '+e.message}finally{$('runBench').disabled=false}}
-function render(d){const h=d.history||[],a=d.active||[],m=d.memory||{},ms=d.models||{},c=d.cache||{},aff=d.route_affinity||{},pin=d.manual_pin||{},b=d.benchmarks||{};$('status').textContent='Updated '+new Date().toLocaleTimeString();$('mem').textContent=val(m.available_gb)+' GiB';$('membar').style.width=Math.max(0,Math.min(100,(m.available_gb/(m.total_gb||1))*100))+'%';$('pressure').textContent=m.hard_pressure?'HARD':m.pressure?'GUARD':'NORMAL';$('pressure').className='v '+(m.hard_pressure?'bad':m.pressure?'warn':'good');$('active').textContent=a.length;$('req').textContent=h.length;const resident=['moe','dense'].filter(k=>ms[k]?.running).join(' + ')||'none';$('backend').textContent=resident.toUpperCase();const tt=h.filter(x=>x.ttft_ms!=null),tp=h.filter(x=>x.gen_tps!=null);$('ttft').textContent=tt.length?sec(tt.reduce((s,x)=>s+x.ttft_ms,0)/tt.length):'—';$('tps').textContent=tp.length?(tp.reduce((s,x)=>s+x.gen_tps,0)/tp.length).toFixed(1)+' t/s':'—';$('cost').textContent=h.reduce((s,x)=>s+(x.compute_score||0),0).toFixed(1);$('cacheEntries').textContent=c.entries||0;$('cacheHits').textContent=c.hits||0;$('pins').textContent='OFF';$('manualPin').textContent='OFF';$('manualPin').className='v good';$('routingState').textContent=d.config?.routing_enabled?'STATELESS':'DISABLED';
+function render(d){const h=d.history||[],a=d.active||[],m=d.memory||{},ms=d.models||{},c=d.cache||{},aff=d.route_affinity||{},pin=d.manual_pin||{},b=d.benchmarks||{};$('status').textContent='Updated '+new Date().toLocaleTimeString();$('mem').textContent=val(m.available_gb)+' GiB';$('membar').style.width=Math.max(0,Math.min(100,(m.available_gb/(m.total_gb||1))*100))+'%';$('pressure').textContent=m.hard_pressure?'HARD':m.pressure?'GUARD':'NORMAL';$('pressure').className='v '+(m.hard_pressure?'bad':m.pressure?'warn':'good');$('active').textContent=a.length;$('req').textContent=h.length;const resident=['moe','dense'].filter(k=>ms[k]?.running).join(' + ')||'none';$('backend').textContent=resident.toUpperCase();const tt=h.filter(x=>x.ttft_ms!=null),tp=h.filter(x=>x.gen_tps!=null);$('ttft').textContent=tt.length?sec(tt.reduce((s,x)=>s+x.ttft_ms,0)/tt.length):'—';$('tps').textContent=tp.length?(tp.reduce((s,x)=>s+x.gen_tps,0)/tp.length).toFixed(1)+' t/s':'—';$('cost').textContent=h.reduce((s,x)=>s+(x.compute_score||0),0).toFixed(1);$('cacheEntries').textContent=c.entries||0;$('cacheHits').textContent=c.hits||0;$('pins').textContent='OFF';$('manualPin').textContent='OFF';$('manualPin').className='v good';$('routingState').textContent=d.config?.routing_enabled?'DETERMINISTIC':'DISABLED';
 $('modelRows').innerHTML=Object.entries(ms).map(([k,x])=>`<tr><td>${esc(k)}</td><td>${esc(x.model)}</td><td class=${x.running?'good':'bad'}>${x.running?'RUNNING':'STOPPED'}</td><td>${esc(x.endpoint)}</td></tr>`).join('');$('activeRows').innerHTML=a.map(x=>`<tr><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td><td>${sec(x.ttft_ms)}</td><td>${val(x.memory_available_gb)} GiB</td><td>${Math.round(Date.now()/1000-x.started)}s</td></tr>`).join('')||'<tr><td colspan=6>No active requests</td></tr>';
 $('historyRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.route)}</td><td class=reason>${esc(x.route_reason)}</td><td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${val(x.total_tokens)}</td><td>${x.gen_tps?x.gen_tps.toFixed(1):'—'}</td><td>${val(x.compute_score)}</td><td class=${x.status>=400?'bad':'good'}>${x.status}</td></tr>`).join('')||'<tr><td colspan=10>No requests</td></tr>';$('routeRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.route)}</td><td>${esc(x.task_type||'—')} · ${esc(x.effort||'—')} · thinking ${x.thinking==null?'—':x.thinking?'on':'off'} · ${val(x.effective_max_tokens)} tokens</td><td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td><td class=reason>${esc(x.route_reason)}</td><td>${sec(x.router_ms)}</td><td>${x.cache_hit?'HIT':'—'}</td></tr>`).join('');
-const suites=b.suites||{};suiteData=suites;if(!$('suite').options.length){$('suite').innerHTML=Object.entries(suites).map(([id,x])=>`<option value=${esc(id)}>${esc(x.name)} — ${esc(x.description)}</option>`).join('');showPrompt()}const jobs=b.jobs||[];renderLivePi(jobs);$('jobRows').innerHTML=jobs.slice().reverse().map(j=>`<tr><td>${new Date(j.created_at*1000).toLocaleTimeString()}</td><td>${esc(j.suite)}</td><td>${esc(j.routes.join(', '))}</td><td class=${j.status==='failed'?'bad':j.status==='complete'?'good':'warn'}>${esc(j.status)}</td><td>${esc(j.stage||j.current_route||'—')}</td><td>${esc(j.error||j.restore_error||'—')}</td></tr>`).join('')||'<tr><td colspan=6>No benchmark jobs</td></tr>';$('runBench').disabled=a.length>0||jobs.some(j=>['queued','running'].includes(j.status));benchmarkResults=b.history||[];const groups=[...new Set(benchmarkResults.map(x=>x.job_id).filter(Boolean))].reverse();const prior=$('compareJob').value;$('compareJob').innerHTML='<option value="">Choose a completed run</option>'+groups.map(id=>{const x=benchmarkResults.find(r=>r.job_id===id);return `<option value="${esc(id)}">${esc(x?.suite||'benchmark')} · ${new Date((x?.ts||0)*1000).toLocaleString()}</option>`}).join('');if(selectedCompareJob&&groups.includes(selectedCompareJob)){selectComparison(selectedCompareJob)}else if(prior&&groups.includes(prior)){selectComparison(prior)}$('benchRows').innerHTML=benchmarkResults.slice().reverse().map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.suite)}</td><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td><b>${x.evaluation?.readiness_score??'—'}</b>${x.evaluation?' / 100':''}</td><td><button class=action onclick="selectComparison('${esc(x.job_id||'')}')">Compare output</button></td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${sec(x.latency_ms)}</td><td>${val(x.prompt_tokens)}</td><td>${val(x.completion_tokens)}</td><td>${val(x.gen_tps)}</td><td>${val(x.available_before_gb)} → ${val(x.available_after_gb)} GiB</td><td>${x.swap_delta_mb==null?'Unavailable':x.swap_delta_mb+' MB'}</td><td>${val(x.compute_score)}</td></tr>`).join('')||'<tr><td colspan=15>No benchmark results</td></tr>'}
+const suites=b.suites||{};suiteData=suites;if(!$('suite').options.length){$('suite').innerHTML=Object.entries(suites).map(([id,x])=>`<option value=${esc(id)}>${esc(x.name)} — ${esc(x.description)}</option>`).join('');showPrompt()}const jobs=b.jobs||[];renderLivePi(jobs);$('jobRows').innerHTML=jobs.slice().reverse().map(j=>`<tr><td>${new Date(j.created_at*1000).toLocaleTimeString()}</td><td>${esc(j.suite)}</td><td>${esc(j.routes.join(', '))}</td><td class=${j.status==='failed'?'bad':j.status==='complete'?'good':'warn'}>${esc(j.status)}</td><td>${esc(j.stage||j.current_route||'—')}</td><td>${esc(j.error||j.restore_error||'—')}</td></tr>`).join('')||'<tr><td colspan=6>No benchmark jobs</td></tr>';$('runBench').disabled=a.length>0||jobs.some(j=>['queued','running'].includes(j.status));benchmarkResults=b.history||[];const groups=[...new Set(benchmarkResults.map(x=>x.job_id).filter(Boolean))].reverse();const prior=$('compareJob').value;$('compareJob').innerHTML='<option value="">Choose a completed run</option>'+groups.map(id=>{const x=benchmarkResults.find(r=>r.job_id===id);return `<option value="${esc(id)}">${esc(x?.suite||'benchmark')} · ${new Date((x?.ts||0)*1000).toLocaleString()}</option>`}).join('');if(selectedCompareJob&&groups.includes(selectedCompareJob)){selectComparison(selectedCompareJob)}else if(prior&&groups.includes(prior)){selectComparison(prior)}$('benchRows').innerHTML=benchmarkResults.slice().reverse().map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.suite)}</td><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td><b>${x.evaluation?.readiness_score??'—'}</b>${x.evaluation?' / 100':''}</td><td><button class=action onclick="selectComparison('${esc(x.job_id||'')}')">Compare output</button></td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${sec(x.total_time_ms??(x.latency_ms==null?null:x.latency_ms+(x.swap_ms||0)))}</td><td>${sec(x.latency_ms)}</td><td>${val(x.pi_tool_calls)}</td><td>${val(x.pi_model_requests)}</td><td>${val(x.prompt_tokens)}</td><td>${val(x.completion_tokens)}</td><td>${val(x.average_tps)}</td><td>${val(x.available_before_gb)} → ${val(x.available_after_gb)} GiB</td><td>${x.swap_delta_mb==null?'Unavailable':x.swap_delta_mb+' MB'}</td><td>${val(x.compute_score)}</td></tr>`).join('')||'<tr><td colspan=18>No benchmark results</td></tr>'}
 async function tick(){try{const r=await fetch('/metrics',{cache:'no-store'}),d=await r.json();benchmarkJobs=d.benchmarks?.jobs||[];render(d);enforceComparisonLocks()}catch(e){$('status').textContent='Dashboard error: '+e.message}}setInterval(tick,1200);tick();
 </script></body></html>"""
 
