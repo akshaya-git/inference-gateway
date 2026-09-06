@@ -1,11 +1,11 @@
 """Deterministic task routing. No inference, network calls, or tool-text scoring."""
-from collections import OrderedDict
-from copy import deepcopy
 import hashlib
 import json
-from pathlib import Path
 import re
 import threading
+from collections import OrderedDict
+from copy import deepcopy
+from pathlib import Path
 
 PREFIX = re.compile(r'^\s*\[(model|complexity):(dense|moe|[1-6])\]\s*', re.I)
 

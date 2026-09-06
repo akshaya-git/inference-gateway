@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 from unittest.mock import Mock
+
 import pytest
 
 spec = importlib.util.spec_from_file_location('stack', Path(__file__).parents[1] / 'scripts/stack.py')

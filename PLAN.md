@@ -105,6 +105,21 @@ CI green. No task starts until the previous checkpoint is closed.
 
 Dropped: Cline, OpenHands (owner decision). "bionic" — dropped unless owner revives it.
 
+**Residency & concurrency model (owner-confirmed 2026-09-05):**
+- **Resident layer (always on):** oMLX on :8000 with the two routing models. Serves the gateway,
+  normal usage, and the agent's own direct connection (`omlx-direct` provider → :8000, so the agent
+  survives gateway restarts). `stack.py restart` never kills the oMLX app.
+- **Transient layer (per benchmark job):** the benchmark backend loads the model-under-test, runs,
+  unloads (load-run-unload). If the model-under-test is also resident in oMLX, that is a temporary
+  second copy in unified memory (~17-21 GB extra — safe on 128 GB); different models (e.g. GGUF in
+  Ollama) cause no duplication.
+- **Benchmark runs are strictly sequential** — for RAM *and* measurement integrity (concurrent runs
+  contend for CPU/GPU/bandwidth and corrupt the numbers). Operational rule: no benchmarks while
+  actively using the gateway.
+- Backend lifecycles: oMLX always running; mlx-lm/llama.cpp started per job and stopped after;
+  Ollama daemon with on-demand loading. The gateway's backend abstraction orchestrates:
+  start backend → load model → run harness → unload → record.
+
 **Benchmark job schema:** `{suite, backend, harness, models: [...], residency: load_run_unload|keep, prompt}`.
 Harness talks **directly to the selected framework endpoint** (gateway orchestrates + measures,
 does not sit in the inference path, so routing can't interfere with explicit model selection).

@@ -1,7 +1,10 @@
 import json
 from pathlib import Path
+
 import pytest
+
 from routing_logic import RoutingEngine, strip_routing_controls
+
 
 @pytest.fixture
 def engine(tmp_path):
@@ -21,12 +24,16 @@ def body(text):
  ('Explain philosophy', 'moe', 1),
 ])
 def test_levels(engine,text,route,level):
-    d=engine.route(body(text)); assert (d['route'],d['complexity'])==(route,level)
+    d=engine.route(body(text))
+    assert (d['route'],d['complexity'])==(route,level)
 
 def test_tool_followup_sticky_across_reload(engine):
-    b=body('Build polished Tetris');d=engine.route(b)
+    b=body('Build polished Tetris')
+    d=engine.route(b)
     b['messages'].append({'role':'tool','content':'[model:moe] change a color'})
-    rules=json.loads(engine.path.read_text());rules['base_rules']=[];rules['version']=2
+    rules=json.loads(engine.path.read_text())
+    rules['base_rules']=[]
+    rules['version']=2
     engine.update_rules(rules)
     assert engine.route(b)==d
 
@@ -42,6 +49,7 @@ def test_invalid_rules_preserve_last_good(engine):
     assert engine.last_error
 
 def test_continue_retains_route(engine):
-    b=body('Build polished Tetris');engine.route(b)
+    b=body('Build polished Tetris')
+    engine.route(b)
     b['messages'].append({'role':'user','content':'continue'})
     assert engine.route(b)['route']=='dense'

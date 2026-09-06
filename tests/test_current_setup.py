@@ -1,7 +1,9 @@
 """Model switching against a fake oMLX server; never touches live models."""
 import httpx
 import pytest
+
 import proxy
+
 
 @pytest.fixture(autouse=True)
 def single_backend_mode(monkeypatch):
