@@ -101,7 +101,7 @@ class TestRealIntegration:
         assert response.status_code == 200
         data = response.json()
         assert "memory" in data
-        assert data["memory"]["total_gb"] == 64.0
+        assert data["memory"]["total_gb"] == 128.0
         assert data["memory"]["available_gb"] > 0
 
 
@@ -112,16 +112,17 @@ class TestLoadTests:
         """Test concurrent request handling."""
         import asyncio
 
-        async def make_request(i):
-            return gateway_client.post("/v1/chat/completions", json={
-                "model": "gateway-auto",
-                "messages": [{"role": "user", "content": f"Test request {i}"}],
-                "max_tokens": 50,
-            })
+        async def run_all():
+            async with httpx.AsyncClient(base_url="http://localhost:9000", timeout=60.0) as client:
+                async def make_request(i):
+                    return await client.post("/v1/chat/completions", json={
+                        "model": "gateway-auto",
+                        "messages": [{"role": "user", "content": f"Test request {i}"}],
+                        "max_tokens": 50,
+                    })
+                return await asyncio.gather(*[make_request(i) for i in range(3)])
 
-        # Make 3 concurrent requests
-        tasks = [make_request(i) for i in range(3)]
-        responses = asyncio.get_event_loop().run_until_complete(asyncio.gather(*tasks))
+        responses = asyncio.run(run_all())
 
         # All should complete (success or graceful failure)
         assert all(r.status_code in (200, 502, 503) for r in responses)

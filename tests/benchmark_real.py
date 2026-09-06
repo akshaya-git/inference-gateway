@@ -71,9 +71,9 @@ def run_benchmarks(base_url: str = "http://localhost:9000") -> dict:
 
     results = {
         "hardware": {
-            "chip": "Apple M3 Max",
-            "ram_gb": 64,
-            "cpu_cores": 16,
+            "chip": "Apple M5 Max",
+            "ram_gb": 128,
+            "cpu_cores": 18,
         },
         "models": {},
     }
@@ -89,5 +89,10 @@ def run_benchmarks(base_url: str = "http://localhost:9000") -> dict:
 
 
 if __name__ == "__main__":
+    import sys
+
     results = run_benchmarks()
-    print(json.dumps(results, indent=2))
+    output = sys.argv[1] if len(sys.argv) > 1 else "tests/benchmark_results.json"
+    with open(output, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Baseline written to {output}")

@@ -73,7 +73,7 @@ CI green. No task starts until the previous checkpoint is closed.
 |----|------|-------|-------|-------------------|
 | **CP-1** ✅ | **Task 1: CI/CD re-run** | `ci.yml` covers `routing_logic.py`, `routing_rules.json` (validation test), `scripts/stack.py`; ruff clean; unit tests in CI; pre-commit verified | Baseline `d762373` pushed | **Closed**: ruff fixes + Python 3.12/3.13/3.14 matrix; CI green on `c500024` |
 | **CP-2** ✅ | **Task 3 rework: routing fixes + rationale** | R1–R8 above; deterministic decision fields (level, matched rules, source, rules_version) in `Metric` + dashboard + `/api/routing-rationale` export | CP-1 closed | **Closed**: rules v2, 12-prompt regression suite, dead code removed, CI green (see CP-2 log below) |
-| **CP-3** | **Task 2: integration re-baseline** | Live stack (oMLX running with both models), 10 integration tests, `benchmark_real.py`, M5 Max 128 GB baselines with Qwen3.6-6bit + Qwen3.8-oQ6e | CP-2 closed (fixed routing before generating data) | Integration tests pass, new baselines committed |
+| **CP-3** ✅ | **Task 2: integration re-baseline** | Live stack (oMLX running with both models), 10 integration tests, `benchmark_real.py`, M5 Max 128 GB baselines with Qwen3.6-6bit + Qwen3.8-oQ6e | CP-2 closed (fixed routing before generating data) | **Closed**: gateway cutover to project folder, 10/10 integration tests, M5 Max baselines committed (see CP-3 log below) |
 | **CP-4** | **Task 6 + Task 9: backend abstraction + model swappability** | `BackendInterface` ABC; `OMLXBackend` (OpenAI-compatible chat + admin residency); `OpenAIBackend` (generic — covers MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio); `backends:` config in `router.yaml`; documented model-change procedure + tests (config change, no code change → routes to new model) | CP-3 closed (live stack for validation) | Behavior unchanged via interface; model swap tested; CI green |
 | **CP-5** | **Task 10 (new): multi-axis benchmark lab** | Model dropdown (all backend models, **load-run-unload** residency to preserve RAM); framework dropdown (backends from config); harness dropdown (installed detection) + adapters; 3-axis results (model × framework × harness) with backend/harness columns | CP-4 closed | Any model × framework × installed harness runnable; RAM preserved; CI green |
 | **CP-6** | **Task 5: cache enhancement** | Semantic dedup + warming + `/api/cache/analytics` + dashboard | CP-5 closed | Tests pass, CI green |
@@ -135,7 +135,7 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
 | # | Task | File | Status |
 |---|------|------|--------|
 | 1 | CI/CD Pipeline | [docs/task-1-cicd.md](docs/task-1-cicd.md) | ✅ closed in CP-1 (`c500024`, CI green) |
-| 2 | Testing Environment | [docs/task-2-testing.md](docs/task-2-testing.md) | 🔄 re-baseline in CP-3 |
+| 2 | Testing Environment | [docs/task-2-testing.md](docs/task-2-testing.md) | ✅ re-baselined in CP-3 (M5 Max, 10/10 integration) |
 | 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | ✅ closed in CP-2 (rules v2, R1–R8, rationale capture) |
 | 4 | Benchmark Suites | [docs/task-4-benchmarks.md](docs/task-4-benchmarks.md) | ✅ core done (5 artifact suites); live runs in CP-3/CP-5 |
 | 5 | Cache Enhancement | [docs/task-5-cache.md](docs/task-5-cache.md) | ⬜ CP-6 |
@@ -183,3 +183,20 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
   (was L5 dense via benchmark vocabulary). Benchmark runs use explicit aliases, so
   benchmark data is unaffected.
 - Tests: 113 passed, 10 deselected (CI-equivalent). Ruff clean.
+
+## CP-3 completion log (2026-09-06)
+
+- **Gateway cutover**: old gateway (running from `/Users/darthvader/Documents/mlx_proxy/`)
+  stopped after confirming the agent's model path was direct (omlx-direct → oMLX :8000;
+  zero gateway traffic for 108 min while the agent was active). New gateway started from
+  `/Users/darthvader/code/inference-gateway` via `scripts/stack.py start`; verified
+  `/health` (router_config path), `/routing/rules` (v2), `/metrics` (capabilities, no
+  judge_model), and a live `gateway-auto` request (L1 moe, 200, rationale captured).
+- **Integration tests**: 10/10 passing against the live stack. Fixes: `test_memory_status`
+  now asserts 128 GB (was 64); `test_concurrent_requests` rewritten for Python 3.14
+  (`asyncio.run` + `httpx.AsyncClient` — the old `get_event_loop` pattern is removed in
+  3.14 and the sync client serialized the "concurrent" requests).
+- **Baselines**: `benchmark_real.py` hardware block updated to M5 Max/128 GB/18 cores;
+  output now written as clean JSON (the old file was contaminated with stdout prints).
+  New M5 Max baselines in `tests/benchmark_results.json` (MoE ~2.5x faster than dense on
+  medium/complex 100-token completions).

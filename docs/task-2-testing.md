@@ -1,11 +1,27 @@
 # Task 2: Real Integration Testing
 
-## Status: 🔄 IN PROGRESS
+## Status: ✅ RE-BASELINED (CP-3, 2026-09-06)
 
-**Hardware:** Apple M3 Max, 64GB RAM, 16 cores  
-**Models Loaded:** Arch-Router (1.6GB), Qwen3.8-27B-oQ4e-mtp (15.4GB)  
-**Available RAM:** 17.13GB | **Used:** 46.87GB (73.2%)  
-**Gateway:** Running on port 9000 | **oMLX:** Running on port 8080
+**Hardware:** Apple M5 Max, 128GB RAM, 18 cores
+**Models Loaded:** Qwen3.6-35B-A3B-6bit (MoE workhorse), Qwen3.8-27B-oQ6e-mtp (dense specialist)
+**Gateway:** Running on port 9000 (from `/Users/darthvader/code/inference-gateway`) | **oMLX:** Running on port 8000
+**Integration tests:** 10/10 passing against the live stack
+
+### M5 Max baseline (2026-09-06, `tests/benchmark_results.json`)
+
+Latency for 100-token completions (5 iterations each, unique prompts):
+
+| Model | Prompt | Avg latency | p95 | TPS |
+|-------|--------|-------------|-----|-----|
+| gateway-moe (Qwen3.6-35B-A3B-6bit) | simple | 1585 ms | 3044 ms | 63.1 |
+| gateway-moe | medium | 1214 ms | 1218 ms | 82.3 |
+| gateway-moe | complex | 1211 ms | 1214 ms | 82.6 |
+| gateway-dense (Qwen3.8-27B-oQ6e-mtp) | simple | 1653 ms | 1909 ms | 27.2 |
+| gateway-dense | medium | 2926 ms | 3041 ms | 34.2 |
+| gateway-dense | complex | 3275 ms | 3414 ms | 30.5 |
+
+MoE is ~2.5x faster on medium/complex prompts (3B active params vs 27B dense).
+These are functional latency baselines; the 5-artifact benchmark suites run in CP-5.
 
 ## Overview
 
