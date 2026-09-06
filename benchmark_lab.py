@@ -59,37 +59,46 @@ def _mlx_snapshot(repo: str) -> str:
 MODELS: dict[str, dict[str, Any]] = {
     "qwen3.6-35b-a3b": {
         "label": "Qwen3.6 35B-A3B (6-bit)",
-        # oMLX: request model ID (double-dash repo name)
-        "omlx": "mlx-community--Qwen3.6-35B-A3B-6bit",
-        # MLX (mlx_lm.server): local path to start the server + request model ID
-        "mlx_path": _mlx_snapshot("mlx-community--Qwen3.6-35B-A3B-6bit"),
-        "mlx_id": "mlx-community/Qwen3.6-35B-A3B-6bit",
-        # llama.cpp: GGUF path to start the server + request alias
-        "llamacpp_path": str(GGUF_DIR / "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),
-        "llamacpp_id": "qwen3_6_35b_a3b",
-        # Ollama: model name (created from the GGUF)
-        "ollama": "bench/qwen36-35b-a3b-q6",
+        "artifacts": {
+            "omlx": {"id": "mlx-community--Qwen3.6-35B-A3B-6bit"},
+            "mlx": {"path": _mlx_snapshot("mlx-community--Qwen3.6-35B-A3B-6bit"),
+                    "id": "mlx-community/Qwen3.6-35B-A3B-6bit"},
+            "llamacpp": {"path": str(GGUF_DIR / "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),
+                         "id": "qwen3_6_35b_a3b"},
+            "ollama": {"name": "bench/qwen36-35b-a3b-q6",
+                       "gguf": str(GGUF_DIR / "Qwen3.6-35B-A3B-UD-Q6_K.gguf")},
+        },
     },
     "qwen3.8-27b": {
         "label": "Qwen3.8 27B (6-bit)",
-        "omlx": "scottlowry--Qwen3.8-27B-oQ6e-mtp",
-        "mlx_path": _mlx_snapshot("scottlowry--Qwen3.8-27B-oQ6e-mtp"),
-        "mlx_id": "scottlowry/Qwen3.8-27B-oQ6e-mtp",
-        "llamacpp_path": str(GGUF_DIR / "Qwen3.8-27B-UD-Q6_K.gguf"),
-        "llamacpp_id": "qwen3_8_27b",
-        "ollama": "bench/qwen38-27b-q6",
+        "artifacts": {
+            "omlx": {"id": "scottlowry--Qwen3.8-27B-oQ6e-mtp"},
+            # Full 6-bit OptiQ MLX base model for mlx_lm.server. (The
+            # lukaskremla/Qwen3.8-27B-MTP-6bit-MLX repo is only the MTP drafter
+            # sidecar, not a standalone model; MTP speedup is covered by MTPLX.)
+            "mlx": {"path": _mlx_snapshot("mlx-community--Qwen3.8-27B-oQ6"),
+                    "id": "mlx-community/Qwen3.8-27B-oQ6"},
+            # MTPLX: native MTP speculative-decoding build (its own artifact).
+            "mtplx": {"id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality"},
+            "llamacpp": {"path": str(GGUF_DIR / "Qwen3.8-27B-UD-Q6_K.gguf"),
+                         "id": "qwen3_8_27b"},
+            "ollama": {"name": "bench/qwen38-27b-q6",
+                       "gguf": str(GGUF_DIR / "Qwen3.8-27B-UD-Q6_K.gguf")},
+        },
     },
 }
 
 FRAMEWORKS: dict[str, dict[str, Any]] = {
     "omlx": {"port": 8000, "resident": True, "label": "oMLX (resident)"},
     "mlx": {"port": 8200, "resident": False, "label": "MLX (mlx_lm.server)"},
+    "mtplx": {"port": 8400, "resident": False, "label": "MTPLX (MTP MLX)"},
     "llamacpp": {"port": 8300, "resident": False, "label": "llama.cpp (llama-server)"},
     "ollama": {"port": 11434, "resident": False, "label": "Ollama"},
 }
 
 HARNESSES: dict[str, dict[str, Any]] = {
     "raw": {"label": "raw HTTP (baseline)", "available": True},
+    "bionic": {"label": "Bionic (LM Studio GUI)", "available": True},
     "omp": {"label": "omp", "available": shutil.which("omp") is not None},
     "pi": {"label": "pi", "available": shutil.which("pi") is not None},
     "sisyphus": {"label": "Sisyphus (opencode)", "available": shutil.which("opencode") is not None},
@@ -103,21 +112,34 @@ BENCH_PROMPT = (
 )
 
 
+def _artifact(framework: str, model_key: str) -> dict[str, Any] | None:
+    """The per-framework artifact spec for a logical model (or None)."""
+    return MODELS.get(model_key, {}).get("artifacts", {}).get(framework)
+
+
 def model_id_for(framework: str, model_key: str) -> str:
     """The model identifier to put in a request for a logical model."""
-    spec = MODELS[model_key]
-    return {
-        "omlx": spec["omlx"],
-        "mlx": spec["mlx_id"],
-        "llamacpp": spec["llamacpp_id"],
-        "ollama": spec["ollama"],
-    }[framework]
+    art = _artifact(framework, model_key)
+    if not art:
+        raise ValueError(f"no {framework} artifact for model {model_key}")
+    return art.get("id") or art.get("name")
 
 
 def server_model_path(framework: str, model_key: str) -> str:
-    """The on-disk model path used to start a server framework."""
-    spec = MODELS[model_key]
-    return {"mlx": spec["mlx_path"], "llamacpp": spec["llamacpp_path"]}[framework]
+    """The on-disk model path used to start a server framework (may be empty)."""
+    art = _artifact(framework, model_key) or {}
+    return art.get("path", "")
+
+
+def ollama_gguf(model_key: str) -> str:
+    """The GGUF path used to create an Ollama model for a logical model."""
+    art = _artifact("ollama", model_key) or {}
+    return art.get("gguf", "")
+
+
+def framework_available_for(framework: str, model_key: str) -> bool:
+    """True if a (model, framework) combo has an artifact (else grey it out)."""
+    return framework in MODELS.get(model_key, {}).get("artifacts", {})
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +204,22 @@ class FrameworkManager:
     # -- server frameworks (mlx, llamacpp) --------------------------------
 
     def _server_cmd(self, framework: str, model_key: str) -> list[str]:
-        model_ref = server_model_path(framework, model_key)
         port = FRAMEWORKS[framework]["port"]
         if framework == "mlx":
+            model_ref = server_model_path("mlx", model_key)
             return [str(MLX_SERVER), "--model", model_ref,
                     "--host", "127.0.0.1", "--port", str(port)]
         if framework == "llamacpp":
-            alias = MODELS[model_key]["llamacpp_id"]
+            model_ref = server_model_path("llamacpp", model_key)
+            alias = model_id_for("llamacpp", model_key)
             return ["llama-server", "-m", model_ref,
                     "--host", "127.0.0.1", "--port", str(port),
                     "--alias", alias, "--ctx-size", "8192"]
+        if framework == "mtplx":
+            model_id = model_id_for("mtplx", model_key)
+            return ["mtplx", "serve", "--model", model_id,
+                    "--host", "127.0.0.1", "--port", str(port),
+                    "--no-auth", "--download", "--yes"]
         raise ValueError(f"unknown server framework: {framework}")
 
     def _stop_server(self, framework: str) -> None:
@@ -284,7 +312,7 @@ class FrameworkManager:
 
     def _ollama_create_from_gguf(self, model_key: str, model_id: str) -> None:
         """Create an Ollama model from a local GGUF via a Modelfile."""
-        gguf = Path(MODELS[model_key]["llamacpp_path"])
+        gguf = Path(ollama_gguf(model_key))
         if not gguf.exists():
             raise RuntimeError(f"GGUF not found for ollama import: {gguf}")
         modelfile = BENCH_STATE_DIR / f"Modelfile-{model_key}"
@@ -647,8 +675,48 @@ def _run_dsh(endpoint: str, model_id: str, prompt: str, iterations: int,
     return res
 
 
+def _run_bionic(endpoint: str, model_id: str, prompt: str, iterations: int,
+                max_tokens: int) -> BenchResult:
+    """Bionic (LM Studio GUI coding agent) harness.
+
+    Bionic is a GUI app (``/Applications/Bionic.app``) that drives the LM Studio
+    server on port 1234. Its full agent behaviour (tool use, multi-step) can
+    only be exercised through the GUI, so this harness measures the LM Studio
+    server that Bionic uses. The model must be loaded in LM Studio (via
+    Bionic.app) before running; the first loaded model is used.
+    """
+    lms_ep = "http://127.0.0.1:1234"
+    res = BenchResult(harness="bionic", framework="lmstudio", model="", iterations=iterations)
+    try:
+        r = httpx.get(f"{lms_ep}/v1/models", timeout=5)
+        r.raise_for_status()
+        models = [m["id"] for m in r.json().get("data", [])]
+    except httpx.HTTPError as e:
+        res.failed = iterations
+        res.error = (f"bionic's LM Studio server ({lms_ep}) is not reachable ({e}). "
+                     "Start Bionic.app, load the model in its GUI, then retry.")
+        return res
+    if not models:
+        res.failed = iterations
+        res.error = ("No model loaded in the LM Studio server. Load one via "
+                     "Bionic.app, then retry.")
+        return res
+    target = model_id if model_id in models else models[0]
+    res.model = target
+    # Delegate to the raw streaming harness against the LM Studio server.
+    inner = _run_raw(lms_ep, target, prompt, iterations, max_tokens)
+    res.ok = inner.ok
+    res.failed = inner.failed
+    res.ttft_ms = inner.ttft_ms
+    res.total_ms = inner.total_ms
+    res.tokens = inner.tokens
+    res.error = inner.error
+    return res
+
+
 HARNESS_RUNNERS = {
     "raw": _run_raw,
+    "bionic": _run_bionic,
     "pi": _run_pi,
     "omp": _run_omp,
     "sisyphus": _run_sisyphus,
@@ -679,6 +747,19 @@ def run_benchmark(framework: str, model_key: str, harness: str,
     work_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     try:
+        if harness == "bionic":
+            # Bionic drives the LM Studio server (port 1234), not the framework
+            # endpoint, so skip the framework ensure/release for this cell.
+            endpoint, model_id = "http://127.0.0.1:1234", ""
+            res = _run_bionic(endpoint, model_id, prompt, iterations, max_tokens)
+            summary = res.summary()
+            summary.update({
+                "framework": framework, "model": model_key, "model_id": res.model,
+                "harness": harness, "endpoint": endpoint, "iterations": iterations,
+                "warmup": 0, "max_tokens": max_tokens,
+                "elapsed_s": round(time.time() - started, 1),
+            })
+            return summary
         endpoint, model_id = manager.ensure(framework, model_key)
         runner = HARNESS_RUNNERS.get(harness)
         if runner is None:
@@ -686,7 +767,7 @@ def run_benchmark(framework: str, model_key: str, harness: str,
         # Warmup (uncounted) — absorbs first-request latency.
         for _ in range(max(warmup, 0)):
             _warmup_once(runner, harness, endpoint, model_id, prompt, max_tokens, work_dir)
-        if harness == "raw":
+        if harness in ("raw", "bionic"):
             res = runner(endpoint, model_id, prompt, iterations, max_tokens)
         elif harness in ("pi", "omp", "sisyphus", "dsh"):
             res = runner(endpoint, model_id, prompt, iterations, max_tokens,
@@ -711,7 +792,7 @@ def run_benchmark(framework: str, model_key: str, harness: str,
                 "harness": harness, "error": str(e),
                 "elapsed_s": round(time.time() - started, 1)}
     finally:
-        if unload_after:
+        if unload_after and harness != "bionic":
             try:
                 manager.release(framework, model_key)
             except Exception:  # noqa: BLE001
@@ -736,16 +817,20 @@ def available_options() -> dict[str, Any]:
     """Options for the dashboard dropdowns."""
     models = []
     for key, spec in MODELS.items():
-        models.append({
-            "key": key,
-            "label": spec["label"],
-            "frameworks": {
-                "omlx": bool(spec.get("omlx")),
-                "mlx": Path(spec.get("mlx_path", "")).exists(),
-                "llamacpp": Path(spec.get("llamacpp_path", "")).exists(),
-                "ollama": bool(spec.get("ollama")),
-            },
-        })
+        arts = spec.get("artifacts", {})
+        frameworks: dict[str, bool] = {}
+        for fw in FRAMEWORKS:
+            art = arts.get(fw)
+            if not art:
+                frameworks[fw] = False  # no artifact for this model -> grey out
+                continue
+            if fw in ("mlx", "llamacpp"):
+                frameworks[fw] = bool(art.get("path")) and Path(art["path"]).exists()
+            elif fw == "ollama":
+                frameworks[fw] = bool(art.get("gguf")) and Path(art["gguf"]).exists()
+            else:  # omlx, mtplx (model resolved by id at run time)
+                frameworks[fw] = True
+        models.append({"key": key, "label": spec["label"], "frameworks": frameworks})
     return {
         "models": models,
         "frameworks": [
@@ -756,6 +841,7 @@ def available_options() -> dict[str, Any]:
             {"key": k, "label": v["label"], "available": v["available"]}
             for k, v in HARNESSES.items()
         ],
+        "default_prompt": BENCH_PROMPT,
     }
 
 

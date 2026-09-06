@@ -7,32 +7,43 @@ model is transient on top of the always-resident oMLX routing models.
 ## Axes
 
 ### Models (logical)
-| key | label | oMLX id | MLX path | llama.cpp GGUF | Ollama name |
-|-----|-------|---------|----------|----------------|-------------|
-| `qwen3.6-35b-a3b` | Qwen3.6 35B-A3B (6-bit) | `mlx-community--Qwen3.6-35B-A3B-6bit` | HF snapshot | `models/gguf/Qwen3.6-35B-A3B-UD-Q6_K.gguf` | `bench/qwen36-35b-a3b-q6` |
-| `qwen3.8-27b` | Qwen3.8 27B (6-bit) | `scottlowry--Qwen3.8-27B-oQ6e-mtp` | HF snapshot | `models/gguf/Qwen3.8-27B-UD-Q6_K.gguf` | `bench/qwen38-27b-q6` |
+| key | label | oMLX id | MLX (mlx_lm.server) | MTPLX | llama.cpp GGUF | Ollama name |
+|-----|-------|---------|---------------------|-------|----------------|-------------|
+| `qwen3.6-35b-a3b` | Qwen3.6 35B-A3B (6-bit) | `mlx-community--Qwen3.6-35B-A3B-6bit` | `mlx-community/Qwen3.6-35B-A3B-6bit` | — | `Qwen3.6-35B-A3B-UD-Q6_K.gguf` | `bench/qwen36-35b-a3b-q6` |
+| `qwen3.8-27b` | Qwen3.8 27B (6-bit) | `scottlowry--Qwen3.8-27B-oQ6e-mtp` | `mlx-community/Qwen3.8-27B-oQ6` | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` | `Qwen3.8-27B-UD-Q6_K.gguf` | `bench/qwen38-27b-q6` |
 
-The registry in `benchmark_lab.py` (`MODELS`) separates the **server-start
-path** (`mlx_path`, `llamacpp_path`) from the **request id** (`mlx_id`,
-`llamacpp_id`, `omlx`, `ollama`). Swapping a model = edit the registry (and
-`router.yaml` for the routing models).
+The registry in `benchmark_lab.py` (`MODELS`) maps each logical model to a
+**per-framework artifact** (`artifacts[framework]`). A (model, framework) combo
+is only valid if an artifact exists — the dashboard greys out the rest, and the
+backend rejects them. Swapping a model = edit the registry (and `router.yaml`
+for the routing models).
+
+> **Dense-model note:** the dense model is MTP in oMLX (`oQ6e-mtp`). For
+> `mlx_lm.server` we use the full 6-bit OptiQ base model
+> (`mlx-community/Qwen3.8-27B-oQ6`) — the `lukaskremla/Qwen3.8-27B-MTP-6bit-MLX`
+> repo is only the MTP **drafter sidecar** (345 MB), not a standalone model.
+> MTP speedup is covered by the **MTPLX** framework (native MTP speculative
+> decoding). llama.cpp/Ollama use the GGUF (no MTP).
 
 ### Frameworks
 | key | what | port | residency |
 |-----|------|------|-----------|
 | `omlx` | oMLX (resident, OpenAI-compatible) | 8000 | always resident; admin load/unload |
 | `mlx` | `mlx_lm.server` (bench venv) | 8200 | started per cell, killed after |
+| `mtplx` | `mtplx serve` (native MTP speculative decoding) | 8400 | started per cell, stopped after |
 | `llamacpp` | `llama-server` (brew) | 8300 | started per cell, killed after |
 | `ollama` | Ollama (brew) | 11434 | model created from GGUF, deleted after |
 
 `FrameworkManager.ensure(framework, model)` returns `(endpoint, model_id)`;
 `release()` tears the framework's copy down. oMLX uses the admin API
 (`/admin/api/models/{id}/load|unload`); the others are subprocess servers.
+MTPLX serves OpenAI-compatible on :8400 (`mtplx serve --model <id> --no-auth`).
 
 ### Harnesses
 | key | what | metrics |
 |-----|------|---------|
 | `raw` | streaming HTTP (baseline) | TTFT, total, exact tokens (usage), decode TPS |
+| `bionic` | Bionic (LM Studio GUI agent) → LM Studio server :1234 | TTFT, total, tokens (measures the LM Studio server Bionic uses) |
 | `pi` | pi coding agent (`PI_CODING_AGENT_DIR` isolated) | total task time, est. tokens |
 | `omp` | omp built-in `bench` (`PI_CODING_AGENT_DIR` isolated) | TTFT, total, exact tokens, generation TPS |
 | `sisyphus` | opencode + Sisyphus agent (`OPENCODE_CONFIG` isolated) | total task time, exact tokens |
@@ -40,7 +51,9 @@ path** (`mlx_path`, `llamacpp_path`) from the **request id** (`mlx_id`,
 
 Agent harnesses (pi, sisyphus, dsh) do not stream, so TTFT is null and TPS is
 output tokens over total task time. omp's built-in bench streams, so it reports
-real TTFT + generation TPS.
+real TTFT + generation TPS. **Bionic** is a GUI app with no headless CLI; its
+harness measures the LM Studio server (port 1234) it drives — the model must be
+loaded in Bionic.app first.
 
 ## Residency model (two layers)
 - **Resident:** oMLX + the two routing models (serves the gateway, normal
@@ -92,3 +105,29 @@ current-job panel, and a results table. Endpoints:
 2. If the routing models change, edit `router.yaml` (see task-6-backend.md).
 3. Restart the gateway (`scripts/stack.py restart`) — routing/backends read at
    startup.
+
+## Status
+
+- [x] Frameworks installed + smoke-tested: oMLX, MLX, **MTPLX**, llama.cpp, Ollama
+- [x] Models: MoE (all frameworks) + **dense (all 5 frameworks, incl. MTPLX MTP)**
+- [x] Harnesses: raw, **bionic**, pi, omp, sisyphus, dsh
+- [x] `benchmark_lab.py` — per-framework artifact registry, `FrameworkManager`,
+      `run_benchmark` (warmup), 6 harness runners
+- [x] Dashboard **3-Axis Lab** tab — dropdowns with **grey-out of incompatible
+      combos**, **prompt window**, job status, results table
+- [x] `proxy.py` — `/lab/*` endpoints with backend guard against invalid
+      (model, framework) combos
+- [x] `docs/model-startup-commands.md` — exact load commands per model/framework
+- [x] Unit tests green (127), ruff clean
+- [ ] Owner: run the full matrix from the dashboard (manual, sequential)
+
+### Dense-model smoke results (2 iters, 64 tokens, raw harness)
+| framework | TTFT (ms) | total (ms) | TPS |
+|-----------|-----------|------------|-----|
+| oMLX | 531.6 | 1977.2 | 44.27 |
+| MLX (mlx_lm.server) | 1348.3 | 4147.7 | 22.86 |
+| **MTPLX (MTP)** | 444.1 | 1735.7 | **49.55** |
+| llama.cpp | 298.0 | 3055.3 | 23.21 |
+| Ollama | 324.8 | 3188.4 | 22.35 |
+
+MTPLX is the fastest (native MTP speculative decoding).
