@@ -30,20 +30,20 @@ MoE model id: `mlx-community--Qwen3.6-35B-A3B-6bit`
 ### MLX — `mlx_lm.server` (:8200)
 ```bash
 ~/.omlx/bench-venv/bin/mlx_lm.server \
-  --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-oQ6/snapshots/<hash> \
-  --host 127.0.0.1 --port 8200
+  --model ~/.cache/huggingface/hub/models--scottlowry--Qwen3.8-27B-oQ6e-mtp/snapshots/<hash> \
+  --host 127.0.0.1 --port 8200 --max-tokens 32768
 ```
-- Dense model: `mlx-community/Qwen3.8-27B-oQ6` (full 6-bit OptiQ base model)
-- The request `model` id is the HF repo name (`mlx-community/Qwen3.8-27B-oQ6`).
-- Note: `lukaskremla/Qwen3.8-27B-MTP-6bit-MLX` is only the MTP **drafter
-  sidecar** (345 MB), not a standalone model — mlx_lm.server cannot serve it
-  alone. MTP speedup is covered by the MTPLX framework instead.
+- Dense model: `scottlowry/Qwen3.8-27B-oQ6e-mtp` (OptiQ 6-bit **MTP**, MLX-format,
+  native 256K context). Same build oMLX serves; already in the HF cache.
+- The request `model` id is the HF repo name (`scottlowry/Qwen3.8-27B-oQ6e-mtp`).
+- `mlx_lm.server` loads the MTP model but does not run MTP spec decoding.
 
 ### MTPLX — `mtplx serve` (:8400)
 ```bash
 mtplx serve \
   --model Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality \
-  --host 127.0.0.1 --port 8400 --no-auth --download --yes
+  --host 127.0.0.1 --port 8400 --no-auth --download --yes \
+  --context-window 131072 --max-tokens 32768
 ```
 - Native MTP speculative decoding (the model's own MTP heads; no external
   drafter). OpenAI-compatible on :8400.
@@ -53,11 +53,14 @@ mtplx serve \
 ### llama.cpp — `llama-server` (:8300)
 ```bash
 llama-server \
-  -m models/gguf/Qwen3.8-27B-UD-Q6_K.gguf \
+  -m models/gguf/Qwen3.8-27B-MTP-Q6_K.gguf \
   --host 127.0.0.1 --port 8300 \
-  --alias qwen3_8_27b --ctx-size 8192
+  --alias qwen3_8_27b --ctx-size 131072 --spec-type draft-mtp
 ```
-- Dense GGUF: `models/gguf/Qwen3.8-27B-UD-Q6_K.gguf` (Q6_K, from unsloth)
+- Dense GGUF: `models/gguf/Qwen3.8-27B-MTP-Q6_K.gguf` (Q6_K **with MTP tensors**,
+  from `Jackrong/Qwen3.8-27B-MTP-GGUF`).
+- `--spec-type draft-mtp` enables MTP speculative decoding (draft acceptance
+  ~55-65%, mean ~2.7 tokens/step).
 - The request `model` id is the alias (`qwen3_8_27b`).
 
 ### Ollama (:11434)
@@ -65,12 +68,12 @@ llama-server \
 # server (if not already running)
 ollama serve
 
-# create the model from the local GGUF (one-time; ~minutes)
-printf 'FROM models/gguf/Qwen3.8-27B-UD-Q6_K.gguf\n' > /tmp/Modelfile-qwen38
+# create the model from the local MTP GGUF (one-time; ~minutes)
+printf 'FROM models/gguf/Qwen3.8-27B-MTP-Q6_K.gguf\nPARAMETER num_ctx 131072\nPARAMETER num_predict 32768\n' > /tmp/Modelfile-qwen38
 ollama create bench/qwen38-27b-q6 -f /tmp/Modelfile-qwen38
 ```
 - The request `model` id is the Ollama name (`bench/qwen38-27b-q6`).
-- Ollama auto-loads the model on first request.
+- Ollama auto-loads the model on first request (no MTP spec decoding).
 
 ### Bionic (LM Studio GUI) — LM Studio server (:1234)
 Bionic is a GUI app (`/Applications/Bionic.app`); it has no headless CLI. It

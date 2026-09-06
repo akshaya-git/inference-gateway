@@ -41,6 +41,10 @@ MLX_VENV = Path.home() / ".omlx" / "bench-venv"
 MLX_SERVER = MLX_VENV / "bin" / "mlx_lm.server"
 BENCH_STATE_DIR = PROJECT_DIR / ".inference-stack" / "bench"
 
+# Benchmark context/output budget (applied to every framework server).
+CONTEXT_WINDOW = 131072   # 131K context (large prefill support)
+MAX_OUTPUT_TOKENS = 32768  # 32K max output tokens
+
 # ---------------------------------------------------------------------------
 # Model registry: logical model -> per-framework representation
 # ---------------------------------------------------------------------------
@@ -70,20 +74,20 @@ MODELS: dict[str, dict[str, Any]] = {
         },
     },
     "qwen3.8-27b": {
-        "label": "Qwen3.8 27B (6-bit)",
+        "label": "Qwen3.8 27B (6-bit, MTP)",
         "artifacts": {
             "omlx": {"id": "scottlowry--Qwen3.8-27B-oQ6e-mtp"},
-            # Full 6-bit OptiQ MLX base model for mlx_lm.server. (The
-            # lukaskremla/Qwen3.8-27B-MTP-6bit-MLX repo is only the MTP drafter
-            # sidecar, not a standalone model; MTP speedup is covered by MTPLX.)
-            "mlx": {"path": _mlx_snapshot("mlx-community--Qwen3.8-27B-oQ6"),
-                    "id": "mlx-community/Qwen3.8-27B-oQ6"},
+            # MTP MLX model (same OptiQ 6-bit MTP build oMLX serves; MLX-format,
+            # native 256K context, mtp_num_hidden_layers=1). Already in HF cache.
+            "mlx": {"path": _mlx_snapshot("scottlowry--Qwen3.8-27B-oQ6e-mtp"),
+                    "id": "scottlowry/Qwen3.8-27B-oQ6e-mtp"},
             # MTPLX: native MTP speculative-decoding build (its own artifact).
             "mtplx": {"id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality"},
-            "llamacpp": {"path": str(GGUF_DIR / "Qwen3.8-27B-UD-Q6_K.gguf"),
+            # MTP GGUF (Q6_K) for llama.cpp / Ollama.
+            "llamacpp": {"path": str(GGUF_DIR / "Qwen3.8-27B-MTP-Q6_K.gguf"),
                          "id": "qwen3_8_27b"},
             "ollama": {"name": "bench/qwen38-27b-q6",
-                       "gguf": str(GGUF_DIR / "Qwen3.8-27B-UD-Q6_K.gguf")},
+                       "gguf": str(GGUF_DIR / "Qwen3.8-27B-MTP-Q6_K.gguf")},
         },
     },
 }
@@ -207,19 +211,27 @@ class FrameworkManager:
         port = FRAMEWORKS[framework]["port"]
         if framework == "mlx":
             model_ref = server_model_path("mlx", model_key)
+            # mlx_lm.server: context is the model's native window (256K for the
+            # MTP build); --max-tokens caps default output. KV cache grows lazily.
             return [str(MLX_SERVER), "--model", model_ref,
-                    "--host", "127.0.0.1", "--port", str(port)]
+                    "--host", "127.0.0.1", "--port", str(port),
+                    "--max-tokens", str(MAX_OUTPUT_TOKENS)]
         if framework == "llamacpp":
             model_ref = server_model_path("llamacpp", model_key)
             alias = model_id_for("llamacpp", model_key)
+            # --spec-type draft-mtp enables MTP speculative decoding when the
+            # GGUF carries MTP tensors (the MTP build does).
             return ["llama-server", "-m", model_ref,
                     "--host", "127.0.0.1", "--port", str(port),
-                    "--alias", alias, "--ctx-size", "8192"]
+                    "--alias", alias, "--ctx-size", str(CONTEXT_WINDOW),
+                    "--spec-type", "draft-mtp"]
         if framework == "mtplx":
             model_id = model_id_for("mtplx", model_key)
             return ["mtplx", "serve", "--model", model_id,
                     "--host", "127.0.0.1", "--port", str(port),
-                    "--no-auth", "--download", "--yes"]
+                    "--no-auth", "--download", "--yes",
+                    "--context-window", str(CONTEXT_WINDOW),
+                    "--max-tokens", str(MAX_OUTPUT_TOKENS)]
         raise ValueError(f"unknown server framework: {framework}")
 
     def _stop_server(self, framework: str) -> None:
@@ -316,7 +328,11 @@ class FrameworkManager:
         if not gguf.exists():
             raise RuntimeError(f"GGUF not found for ollama import: {gguf}")
         modelfile = BENCH_STATE_DIR / f"Modelfile-{model_key}"
-        modelfile.write_text(f"FROM {gguf}\n")
+        modelfile.write_text(
+            f"FROM {gguf}\n"
+            f"PARAMETER num_ctx {CONTEXT_WINDOW}\n"
+            f"PARAMETER num_predict {MAX_OUTPUT_TOKENS}\n"
+        )
         r = subprocess.run(["ollama", "create", model_id, "-f", str(modelfile)],
                            capture_output=True, text=True, timeout=1800)
         if r.returncode != 0:

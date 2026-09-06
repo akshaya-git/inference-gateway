@@ -22,8 +22,8 @@ routes:
       summarization, general reasoning, research synthesis, iterative agent work,
       and routine through moderately complex coding, debugging, and feature work.
     capabilities:
-      context_window: 128000
-      max_output: 32000
+      context_window: 131072
+      max_output: 32768
       vision: false
   dense:
     model: scottlowry--Qwen3.8-27B-oQ6e-mtp
@@ -33,8 +33,8 @@ routes:
       implementation, difficult concurrency or security debugging, and demanding
       code generation where quality is more important than latency.
     capabilities:
-      context_window: 128000
-      max_output: 32000
+      context_window: 131072
+      max_output: 32768
       vision: false
 
 routing:

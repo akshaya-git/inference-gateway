@@ -10,7 +10,7 @@ model is transient on top of the always-resident oMLX routing models.
 | key | label | oMLX id | MLX (mlx_lm.server) | MTPLX | llama.cpp GGUF | Ollama name |
 |-----|-------|---------|---------------------|-------|----------------|-------------|
 | `qwen3.6-35b-a3b` | Qwen3.6 35B-A3B (6-bit) | `mlx-community--Qwen3.6-35B-A3B-6bit` | `mlx-community/Qwen3.6-35B-A3B-6bit` | — | `Qwen3.6-35B-A3B-UD-Q6_K.gguf` | `bench/qwen36-35b-a3b-q6` |
-| `qwen3.8-27b` | Qwen3.8 27B (6-bit) | `scottlowry--Qwen3.8-27B-oQ6e-mtp` | `mlx-community/Qwen3.8-27B-oQ6` | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` | `Qwen3.8-27B-UD-Q6_K.gguf` | `bench/qwen38-27b-q6` |
+| `qwen3.8-27b` | Qwen3.8 27B (6-bit, **MTP**) | `scottlowry--Qwen3.8-27B-oQ6e-mtp` | `scottlowry/Qwen3.8-27B-oQ6e-mtp` | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` | `Qwen3.8-27B-MTP-Q6_K.gguf` | `bench/qwen38-27b-q6` |
 
 The registry in `benchmark_lab.py` (`MODELS`) maps each logical model to a
 **per-framework artifact** (`artifacts[framework]`). A (model, framework) combo
@@ -18,12 +18,27 @@ is only valid if an artifact exists — the dashboard greys out the rest, and th
 backend rejects them. Swapping a model = edit the registry (and `router.yaml`
 for the routing models).
 
-> **Dense-model note:** the dense model is MTP in oMLX (`oQ6e-mtp`). For
-> `mlx_lm.server` we use the full 6-bit OptiQ base model
-> (`mlx-community/Qwen3.8-27B-oQ6`) — the `lukaskremla/Qwen3.8-27B-MTP-6bit-MLX`
-> repo is only the MTP **drafter sidecar** (345 MB), not a standalone model.
-> MTP speedup is covered by the **MTPLX** framework (native MTP speculative
-> decoding). llama.cpp/Ollama use the GGUF (no MTP).
+> **MTP per framework:** each framework uses its own MTP build (they support
+> different formats). The dense model is MTP everywhere:
+> - **oMLX / MLX**: `scottlowry/Qwen3.8-27B-oQ6e-mtp` (OptiQ 6-bit MTP, MLX-format,
+>   native 256K context, `mtp_num_hidden_layers=1`). oMLX and `mlx_lm.server`
+>   are both MLX-based so they share this build. (The `lukaskremla`/`mlx-community`
+>   `MTP-6bit`/`MTP-8bit` repos are drafter sidecars only, not standalone.)
+> - **MTPLX**: `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` (native MTP spec decoding).
+> - **llama.cpp / Ollama**: `Jackrong/Qwen3.8-27B-MTP-Q6_K.gguf` (Q6_K with MTP tensors).
+>
+> **MTP speculative decoding is active in:** oMLX (built-in), MTPLX (native),
+> and llama.cpp (`--spec-type draft-mtp`). `mlx_lm.server` and Ollama load the
+> MTP model but do not run MTP spec decoding (they serve the base model).
+
+### Context / output budget
+Every framework server is configured with **131K context** (`CONTEXT_WINDOW=
+131072`) and **32K max output** (`MAX_OUTPUT_TOKENS=32768`):
+- llama.cpp: `--ctx-size 131072 --spec-type draft-mtp`
+- MTPLX: `--context-window 131072 --max-tokens 32768`
+- Ollama: Modelfile `PARAMETER num_ctx 131072` / `num_predict 32768`
+- MLX: `--max-tokens 32768` (context is the model's native 256K; KV grows lazily)
+- oMLX: `router.yaml` `context_window: 131072` / `max_output: 32768`
 
 ### Frameworks
 | key | what | port | residency |
@@ -121,13 +136,14 @@ current-job panel, and a results table. Endpoints:
 - [x] Unit tests green (127), ruff clean
 - [ ] Owner: run the full matrix from the dashboard (manual, sequential)
 
-### Dense-model smoke results (2 iters, 64 tokens, raw harness)
-| framework | TTFT (ms) | total (ms) | TPS |
-|-----------|-----------|------------|-----|
-| oMLX | 531.6 | 1977.2 | 44.27 |
-| MLX (mlx_lm.server) | 1348.3 | 4147.7 | 22.86 |
-| **MTPLX (MTP)** | 444.1 | 1735.7 | **49.55** |
-| llama.cpp | 298.0 | 3055.3 | 23.21 |
-| Ollama | 324.8 | 3188.4 | 22.35 |
+### Dense-model smoke results (MTP builds, raw harness)
+| framework | MTP spec decoding | TTFT (ms) | total (ms) | TPS |
+|-----------|-------------------|-----------|------------|-----|
+| oMLX | built-in | 531.6 | 1977.2 | 44.27 |
+| MLX (mlx_lm.server) | no (base model) | 480.1 | 2444.3 | 22.40 |
+| **MTPLX** | native | 444.1 | 1735.7 | **49.55** |
+| llama.cpp | `--spec-type draft-mtp` | 357.0 | 4339.2 | 32.14 |
+| Ollama | no (base model) | 334.9 | 3373.8 | 21.06 |
 
-MTPLX is the fastest (native MTP speculative decoding).
+MTPLX is the fastest (native MTP). llama.cpp with MTP spec decoding jumps from
+~22.7 to ~32.1 TPS (draft acceptance ~55-65%, mean ~2.7 tokens/step).
