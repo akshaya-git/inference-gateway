@@ -37,7 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from routing_logic import RoutingEngine, strip_routing_controls
+from routing_logic import RoutingEngine, strip_routing_controls, text_content
 
 ROUTING_ENGINE = RoutingEngine(os.path.join(os.path.dirname(__file__), "routing_rules.json"))
 
@@ -117,6 +117,17 @@ FALLBACK_ROUTE = str(ROUTING_CONFIG.get("fallback_route", "moe"))
 if FALLBACK_ROUTE not in ("moe", "dense"):
     raise RuntimeError("routing.fallback_route must be 'moe' or 'dense'")
 
+# Per-route capability metadata (context window, max output, vision). Drives
+# capability-aware routing adjustments and is reported in /metrics.
+MODEL_CAPABILITIES = {
+    route: {
+        "context_window": int((spec.get("capabilities") or {}).get("context_window") or 0),
+        "max_output": int((spec.get("capabilities") or {}).get("max_output") or 0),
+        "vision": bool((spec.get("capabilities") or {}).get("vision", False)),
+    }
+    for route, spec in ROUTE_CONFIG.items()
+}
+
 # Start protecting the machine when available memory falls below this.
 # 3 GiB is the user's requested safety zone.
 MEMORY_GUARD_GB = float(os.getenv("MEMORY_GUARD_GB", "3"))
@@ -183,6 +194,8 @@ class Metric:
     effort: str = ""
     thinking: Optional[bool] = None
     effective_max_tokens: Optional[int] = None
+    routing_level: Optional[int] = None
+    routing_rules: str = ""
 
 
 history = deque(maxlen=HISTORY_MAX)
@@ -585,133 +598,6 @@ def model_state() -> dict:
     }
 
 
-def last_user_text(body: dict) -> str:
-    messages = body.get("messages") or []
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "\n".join(
-                part.get("text", "") for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-    return ""
-
-
-def message_text(message: dict) -> str:
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            part.get("text", "") for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        )
-    return ""
-
-
-def conversation_key(body: dict) -> Optional[str]:
-    """Stable key for OpenAI-style histories that do not include a thread ID."""
-    messages = body.get("messages") or []
-    first_user = next(
-        (message_text(m) for m in messages if m.get("role") == "user"), ""
-    )
-    if not first_user:
-        return None
-    first_system = next(
-        (message_text(m) for m in messages if m.get("role") == "system"), ""
-    )
-    seed = f"{first_system[:2000]}\n---\n{first_user[:8000]}"
-    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
-
-
-def routing_context(body: dict) -> str:
-    """Recent conversation context, newest-first selection, chronological output."""
-    selected: list[str] = []
-    remaining = ROUTER_CONTEXT_CHARS
-    for message in reversed(body.get("messages") or []):
-        text = message_text(message).strip()
-        if not text:
-            continue
-        role = str(message.get("role", "unknown")).upper()
-        entry = f"{role}:\n{text}"
-        if len(entry) > remaining:
-            entry = entry[-remaining:]
-        selected.append(entry)
-        remaining -= len(entry)
-        if remaining <= 0:
-            break
-    return "\n\n".join(reversed(selected))
-
-
-def router_request_context(body: dict) -> list[dict[str, Any]]:
-    """Preserve standard message/tool structure within the routing context budget."""
-    selected: list[dict[str, Any]] = []
-    remaining = ROUTER_CONTEXT_CHARS
-    for message in reversed(body.get("messages") or []):
-        compact: dict[str, Any] = {"role": str(message.get("role", "unknown"))}
-        content = message.get("content")
-        if content not in (None, ""):
-            compact["content"] = content
-        if message.get("name"):
-            compact["name"] = message["name"]
-        if message.get("tool_call_id"):
-            compact["tool_call_id"] = message["tool_call_id"]
-        if message.get("tool_calls"):
-            compact["tool_calls"] = message["tool_calls"]
-        encoded = json.dumps(compact, ensure_ascii=False, default=str)
-        if len(encoded) > remaining:
-            compact = {
-                "role": compact["role"],
-                "content": encoded[-max(0, remaining - 80):],
-                "truncated": True,
-            }
-            encoded = json.dumps(compact, ensure_ascii=False)
-        selected.append(compact)
-        remaining -= len(encoded)
-        if remaining <= 0:
-            break
-    return list(reversed(selected))
-
-
-def task_routing_context(body: dict) -> str:
-    """Context belonging to the latest user task, excluding older completed tasks."""
-    messages = body.get("messages") or []
-    latest_user = max(
-        (index for index, message in enumerate(messages) if message.get("role") == "user"),
-        default=0,
-    )
-    scoped = dict(body)
-    scoped["messages"] = messages[latest_user:]
-    return routing_context(scoped)
-
-
-def task_state(body: dict) -> dict:
-    messages = body.get("messages") or []
-    users = [message_text(message).strip() for message in messages if message.get("role") == "user"]
-    latest = users[-1] if users else ""
-    return {
-        "user_turn_count": len(users),
-        "message_count": len(messages),
-        "latest_user_hash": hashlib.sha256(latest.encode("utf-8")).hexdigest() if latest else "",
-        "latest_user": latest,
-    }
-
-
-def is_explicit_continuation(text: str) -> bool:
-    normalized = " ".join(text.lower().split())
-    return normalized.startswith((
-        "continue", "go on", "keep going", "proceed", "resume", "retry",
-        "try again", "fix that", "fix it", "do that", "make that change",
-        "okay continue", "ok continue", "now fix", "please fix", "apply that",
-        "implement that", "finish it", "finish this", "complete it", "complete this",
-        "move it", "copy it",
-    ))
-
-
 EFFORT_TOKENS = {"fast": 4096, "balanced": 16384, "high": 32144}
 
 # Versioned guidance for coding-agent harnesses. The gateway injects this only
@@ -768,73 +654,6 @@ def normalize_policy(candidate: dict, fallback: Optional[dict] = None) -> dict:
         )).lower() in ("low", "medium", "high") else "medium",
         "max_tokens": max_tokens,
     }
-
-
-def is_coding_request(body: dict) -> bool:
-    text = task_routing_context(body).lower()
-    coding_artifacts = (
-        "html", "css", "javascript", "typescript", "python", "java ", "swift",
-        "source code", "codebase", "repository", "function", "api", "sql",
-        ".js", ".ts", ".py", ".html", "```",
-    )
-    coding_actions = (
-        "build", "create", "implement", "write", "generate", "code", "debug",
-        "fix", "refactor", "review", "redesign", "develop",
-    )
-    return any(term in text for term in coding_artifacts) and any(
-        term in text for term in coding_actions
-    )
-
-
-def enforce_capability_floors(policy: dict, body: dict) -> dict:
-    policy = dict(policy)
-    if is_coding_request(body) and policy.get("task_type") != "structured_generation":
-        policy.update({
-            "effort": "high",
-            "thinking": True,
-            "reasoning_effort": "medium",
-            "max_tokens": 32144,
-        })
-        if policy.get("task_type") not in ("failure_recovery", "complex_analysis"):
-            policy["task_type"] = "coding"
-        if "coding capability floor" not in policy.get("reason", ""):
-            policy["reason"] = f"{policy.get('reason', 'policy decision')}; coding capability floor"
-    return policy
-
-
-def heuristic_policy(body: dict) -> dict:
-    text = task_routing_context(body)
-    lowered = text.lower()
-    dense_signals = (
-        "review the codebase", "entire codebase", "repository", "repo-wide",
-        "complex logic", "architecture", "debug this", "root cause",
-        "security audit", "formal proof", "multi-step", "10,000", "10000",
-    )
-    failure_signals = (
-        "does not work", "didn't work", "did not work", "broken", "failed",
-        "substandard", "take it back", "redesign", "start over", "fix the implementation",
-    )
-    simple_signals = ("rewrite this sentence", "summarize briefly", "one sentence", "translate this")
-    code_markers = text.count("\n") > 400 or "```" in text
-    if is_coding_request(body) and any(signal in lowered for signal in failure_signals):
-        return normalize_policy({
-            "route": "dense", "confidence": 0.90, "reason": "safety floor: failed implementation requires capable retry",
-            "task_type": "failure_recovery", "effort": "high", "thinking": True,
-        })
-    if len(text) > 30_000 or code_markers or any(signal in lowered for signal in dense_signals):
-        return normalize_policy({
-            "route": "dense", "confidence": 0.82, "reason": "safe heuristic: complex or large-context request",
-            "task_type": "complex_analysis", "effort": "high", "thinking": True,
-        })
-    if any(signal in lowered for signal in simple_signals):
-        return normalize_policy({
-            "route": "moe", "confidence": 0.82, "reason": "safe heuristic: concise transformation",
-            "task_type": "simple_transformation", "effort": "fast", "thinking": False,
-        })
-    return normalize_policy({
-        "route": "moe", "confidence": 0.72, "reason": "safe heuristic: normal request",
-        "task_type": "general", "effort": "balanced", "thinking": True,
-    })
 
 
 async def wait_for_backend_drain_before_routing(req_id: Optional[str]) -> None:
@@ -918,12 +737,59 @@ async def prepare_backend(route: str, reason: str) -> tuple[str, str, float]:
     return route, reason, await ensure_route(route)
 
 
+def capability_adjustment(route: str, body: dict) -> tuple[str, str]:
+    """Capability-aware route adjustment: vision and context window.
+
+    Returns (route, note). The note is appended to the route reason when the
+    route was adjusted or a capability gap is expected.
+    """
+    caps = MODEL_CAPABILITIES.get(route, {})
+    other = "dense" if route == "moe" else "moe"
+    other_caps = MODEL_CAPABILITIES.get(other, {})
+    notes = []
+    has_image = any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for message in body.get("messages") or []
+        for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+    )
+    if has_image and not caps.get("vision", False):
+        if other_caps.get("vision", False):
+            notes.append(f"capability: image content requires vision; switched {route} -> {other}")
+            route = other
+        else:
+            notes.append("capability: image content but no vision-capable model configured")
+    est_tokens = sum(len(text_content(m)) for m in body.get("messages") or []) // 4
+    window = caps.get("context_window") or 0
+    if window and est_tokens > window:
+        other_window = other_caps.get("context_window") or 0
+        if other_window > window:
+            notes.append(f"capability: ~{est_tokens} tokens exceeds {route} window {window}; switched to {other}")
+            route = other
+        else:
+            notes.append(f"capability: ~{est_tokens} tokens exceeds {route} window {window}")
+    return route, "; ".join(notes)
+
+
 async def choose_policy(body: dict, req_id: Optional[str] = None) -> tuple[dict, float]:
     started = now_ms()
-    decision = ROUTING_ENGINE.route(body, explicit=MODEL_ROUTES.get(str(body.get("model", ""))))
+    explicit = MODEL_ROUTES.get(str(body.get("model", "")))
+    if not ROUTING_ENABLED:
+        # Routing disabled: pin to the explicit route or the fallback route.
+        decision = {
+            "route": explicit or FALLBACK_ROUTE, "complexity": None, "code_related": False,
+            "matched_rules": [], "modifiers": [], "invalid_controls": [],
+            "rules_version": ROUTING_ENGINE.rules["version"],
+            "source": "routing disabled", "reason": "routing disabled; pinned to fallback route",
+        }
+    else:
+        decision = ROUTING_ENGINE.route(body, explicit=explicit)
     policy = normalize_policy({**decision, "confidence": 1.0,
                                "task_type": "deterministic", "thinking": True})
     policy.update(decision)
+    route, note = capability_adjustment(policy["route"], body)
+    if note:
+        policy["route"] = route
+        policy["reason"] = f"{policy['reason']}; {note}"
     return policy, now_ms() - started
 
 
@@ -1063,7 +929,7 @@ async def metrics():
                 "routing_mode": "deterministic complexity lookup; code above level 4 uses dense",
                 "router_config": ROUTER_CONFIG_PATH,
                 "fallback_route": FALLBACK_ROUTE,
-                "judge_model": None,
+                "model_capabilities": MODEL_CAPABILITIES,
                 "routing_rules_version": ROUTING_ENGINE.rules["version"],
                 "routing_rules_error": ROUTING_ENGINE.last_error,
             },
@@ -1130,6 +996,30 @@ async def update_routing_rules(request: Request):
         return JSONResponse({"error": str(exc)}, status_code=400)
     response_cache.clear()
     return {"ok": True, "version": ROUTING_ENGINE.rules["version"]}
+
+
+@app.get("/api/routing-rationale")
+async def routing_rationale(limit: int = 100):
+    """Export of recent routing decisions: level, matched rules, source, version."""
+    async with lock:
+        entries = list(history)
+    entries = [m for m in reversed(entries) if m.route and m.route != "cache"]
+    return {
+        "rules_version": ROUTING_ENGINE.rules["version"],
+        "dense_above": ROUTING_ENGINE.rules["dense_above"],
+        "decisions": [
+            {
+                "ts": m.ts,
+                "route": m.route,
+                "level": m.routing_level,
+                "matched_rules": m.routing_rules.split(",") if m.routing_rules else [],
+                "reason": m.route_reason,
+                "requested_model": m.requested_model,
+                "model": m.model,
+            }
+            for m in entries[: max(1, min(limit, 500))]
+        ],
+    }
 
 
 @app.get("/benchmarks")
@@ -1957,6 +1847,7 @@ async def chat(request: Request):
                 active[req_id].update({
                     "route": route,
                     "route_reason": route_reason, "router_confidence": confidence,
+                    "routing_level": policy.get("complexity"),
                     "router_ms": router_ms,
                     "task_type": policy["task_type"], "effort": policy["effort"],
                     "thinking": policy["thinking"], "effective_max_tokens": policy["max_tokens"],
@@ -2079,6 +1970,8 @@ async def proxy_nonstream(
             compute_score=compute_score(elapsed, usage["prompt_tokens"], completion, swap_ms),
             task_type=policy["task_type"], effort=policy["effort"],
             thinking=policy["thinking"], effective_max_tokens=policy["max_tokens"],
+            routing_level=policy.get("complexity"),
+            routing_rules=",".join(policy.get("matched_rules", []) + policy.get("modifiers", [])),
         )
 
         await record(metric)
@@ -2103,6 +1996,8 @@ async def proxy_nonstream(
                 client_wait_ms=client_wait_ms,
                 task_type=policy.get("task_type", ""), effort=policy.get("effort", ""),
                 thinking=policy.get("thinking"), effective_max_tokens=policy.get("max_tokens"),
+                routing_level=policy.get("complexity"),
+                routing_rules=",".join(policy.get("matched_rules", []) + policy.get("modifiers", [])),
             )
         )
         return JSONResponse({"error": str(exc)}, status_code=502)
@@ -2170,6 +2065,8 @@ async def stream_request(
             compute_score=compute_score(elapsed, prompt_tokens, completion_tokens, swap_ms),
             task_type=policy["task_type"], effort=policy["effort"],
             thinking=policy["thinking"], effective_max_tokens=policy["max_tokens"],
+            routing_level=policy.get("complexity"),
+            routing_rules=",".join(policy.get("matched_rules", []) + policy.get("modifiers", [])),
         ))
 
     except asyncio.CancelledError:
@@ -2181,7 +2078,9 @@ async def stream_request(
             error="client disconnected/cancelled", max_tokens=body.get("max_tokens", body.get("max_completion_tokens")),
             streaming=True, client_wait_ms=client_wait_ms, low_memory_events=info.get("low_memory_events", 0),
             task_type=policy.get("task_type", ""), effort=policy.get("effort", ""),
-            thinking=policy.get("thinking"), effective_max_tokens=policy.get("max_tokens")))
+            thinking=policy.get("thinking"), effective_max_tokens=policy.get("max_tokens"),
+            routing_level=policy.get("complexity"),
+            routing_rules=",".join(policy.get("matched_rules", []) + policy.get("modifiers", []))))
         raise
     except Exception as exc:
         await record(Metric(id=req_id, ts=time.time(), model=MODEL_IDS.get(route, ""), requested_model=requested_model,
@@ -2190,7 +2089,9 @@ async def stream_request(
             error=str(exc), max_tokens=body.get("max_tokens", body.get("max_completion_tokens")), streaming=True,
             client_wait_ms=client_wait_ms, low_memory_events=low_memory_events,
             task_type=policy.get("task_type", ""), effort=policy.get("effort", ""),
-            thinking=policy.get("thinking"), effective_max_tokens=policy.get("max_tokens")))
+            thinking=policy.get("thinking"), effective_max_tokens=policy.get("max_tokens"),
+            routing_level=policy.get("complexity"),
+            routing_rules=",".join(policy.get("matched_rules", []) + policy.get("modifiers", []))))
         yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
 
 
@@ -2337,7 +2238,7 @@ section{margin-top:26px;overflow:auto}
 <h2>Active requests</h2>
 <table>
 <thead><tr>
-<th>Route</th><th>Model</th><th>Confidence</th><th>TTFT</th><th>Max tokens</th><th>Memory</th><th>Chunks</th><th>Age</th>
+<th>Route</th><th>Model</th><th>Level</th><th>TTFT</th><th>Max tokens</th><th>Memory</th><th>Chunks</th><th>Age</th>
 </tr></thead>
 <tbody id=activeRows></tbody>
 </table>
@@ -2347,7 +2248,7 @@ section{margin-top:26px;overflow:auto}
 <h2>Request history</h2>
 <table>
 <thead><tr>
-<th>Time</th><th>Route</th><th>Model</th><th>Confidence</th><th>Router</th><th>Swap</th><th>Cache</th>
+<th>Time</th><th>Route</th><th>Model</th><th>Level</th><th>Router</th><th>Swap</th><th>Cache</th>
 <th>TTFT</th><th>Prompt</th><th>Completion</th><th>Total</th><th>Tok/s</th><th>Finish</th><th>Memory</th><th>Status</th>
 </tr></thead>
 <tbody id=historyRows></tbody>
@@ -2407,7 +2308,7 @@ async function tick(){
       <tr>
         <td>${esc(x.route)}</td>
         <td>${esc(x.model)}</td>
-        <td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td>
+        <td>${x.routing_level==null?'—':'L'+x.routing_level}</td>
         <td>${sec(x.ttft_ms)}</td>
         <td>${val(x.max_tokens)}</td>
         <td>${val(x.memory_available_gb)} GiB</td>
@@ -2422,7 +2323,7 @@ async function tick(){
         <td>${new Date(x.ts*1000).toLocaleTimeString()}</td>
         <td title="${esc(x.route_reason)}">${esc(x.route||'—')}</td>
         <td>${esc(x.model)}</td>
-        <td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td>
+        <td>${x.routing_level==null?'—':'L'+x.routing_level}</td>
         <td>${sec(x.router_ms)}</td>
         <td>${sec(x.swap_ms)}</td>
         <td>${x.cache_hit?'HIT':'—'}</td>
@@ -2471,13 +2372,13 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0c1015;border:1px sol
 <div class="tab on" id=overview>
  <div class=grid><div class=card><div class=k>Memory available</div><div class=v id=mem>—</div><div class=bar><div class=fill id=membar></div></div></div><div class=card><div class=k>Pressure</div><div class=v id=pressure>—</div></div><div class=card><div class=k>Active backend</div><div class=v id=backend>—</div></div><div class=card><div class=k>Active requests</div><div class=v id=active>0</div></div><div class=card><div class=k>Completed</div><div class=v id=req>0</div></div><div class=card><div class=k>Average TTFT</div><div class=v id=ttft>—</div></div><div class=card><div class=k>Average generation</div><div class=v id=tps>—</div></div><div class=card><div class=k>Relative compute</div><div class=v id=cost>—</div></div></div>
  <section><h2>Model state</h2><table><thead><tr><th>Role</th><th>Model</th><th>State</th><th>Endpoint</th></tr></thead><tbody id=modelRows></tbody></table></section>
- <section><h2>Active requests</h2><table><thead><tr><th>Route</th><th>Model</th><th>Confidence</th><th>TTFT</th><th>Memory</th><th>Age</th></tr></thead><tbody id=activeRows></tbody></table></section>
- <section><h2>Recent requests</h2><table><thead><tr><th>Time</th><th>Route</th><th>Reason</th><th>Confidence</th><th>Swap</th><th>TTFT</th><th>Tokens</th><th>Tok/s</th><th>Compute</th><th>Status</th></tr></thead><tbody id=historyRows></tbody></table></section>
+ <section><h2>Active requests</h2><table><thead><tr><th>Route</th><th>Model</th><th>Level</th><th>TTFT</th><th>Memory</th><th>Age</th></tr></thead><tbody id=activeRows></tbody></table></section>
+ <section><h2>Recent requests</h2><table><thead><tr><th>Time</th><th>Route</th><th>Reason</th><th>Level</th><th>Swap</th><th>TTFT</th><th>Tokens</th><th>Tok/s</th><th>Compute</th><th>Status</th></tr></thead><tbody id=historyRows></tbody></table></section>
 </div>
 <div class=tab id=routing>
  <div class=grid><div class=card><div class=k>Exact-cache entries</div><div class=v id=cacheEntries>0</div></div><div class=card><div class=k>Cache hits</div><div class=v id=cacheHits>0</div></div><div class=card><div class=k>Route affinity</div><div class=v id=pins>OFF</div></div><div class=card><div class=k>Idle model swapping</div><div class=v id=manualPin>OFF</div></div><div class=card><div class=k>Routing</div><div class=v id=routingState>—</div></div></div>
  <section><h2>Backend controls</h2><div class=notice>Every automatic request is scored by the deterministic routing engine (routing_rules.json): code above complexity level 4 uses dense, everything else uses the MoE workhorse. No client identity, session affinity, route timers, or idle switching are used. Explicit model selections and [model:...] / [complexity:...] controls override the lookup.</div><div class=actions><button class="action primary" onclick="switchModel('moe')">Activate MoE</button><button class="action primary" onclick="switchModel('dense')">Activate dense</button><button class="action danger" onclick="post('/control/cache/clear','Cache cleared')">Clear exact cache</button></div><div id=controlMsg class=muted></div></section>
- <section><h2>Routing decisions</h2><table><thead><tr><th>Time</th><th>Route</th><th>Profile</th><th>Confidence</th><th>Reason</th><th>Router time</th><th>Cache</th></tr></thead><tbody id=routeRows></tbody></table></section>
+ <section><h2>Routing decisions</h2><table><thead><tr><th>Time</th><th>Route</th><th>Profile</th><th>Level</th><th>Reason</th><th>Router time</th><th>Cache</th></tr></thead><tbody id=routeRows></tbody></table></section>
 </div>
 <div class=tab id=benchmarks>
  <div class=card><div class=suite><div><h2>Run a real Pi agent comparison</h2><div class=muted>Each model receives the same prompt in a fresh isolated Pi coding-agent session. Pi may reason, use tools, create files, and validate its work. Models run sequentially and the previous backend is restored.</div></div><button class="action primary" id=runBench onclick=runBenchmark()>Run benchmark</button></div><div class=actions><select id=suite onchange=showPrompt()></select><label id=portraitLabel style="display:none">Portrait subject <select id=portraitSubject onchange=showPrompt()></select></label><label><input type=checkbox id=bmoe checked> MoE</label><label><input type=checkbox id=bdense checked> Dense</label><span class=muted>128K context · up to 32,000 output tokens</span><button class=action onclick=resetPrompt()>Reset standard prompt</button><button class="action danger" onclick=clearBenchmarkHistory()>Clear benchmark history</button></div><div class=muted id=profileHint>Editable prompt sent identically to each selected model through Pi.</div><textarea id=promptEditor aria-label="Benchmark prompt"></textarea><div id=benchMsg class=muted></div></div>
@@ -2509,8 +2410,8 @@ async function post(url,msg,body){try{const r=await fetch(url,{method:'POST',hea
 async function switchModel(route){await post('/control/model/'+route,route.toUpperCase()+' is active and remains resident until another route is needed.')}
 async function runBenchmark(){const routes=[];if($('bmoe').checked)routes.push('moe');if($('bdense').checked)routes.push('dense');if(!routes.length){$('benchMsg').textContent='Select at least one model.';return}const prompt=$('promptEditor').value.trim();if(!prompt){$('benchMsg').textContent='Prompt cannot be empty.';return}$('runBench').disabled=true;try{const r=await fetch('/benchmarks/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({suite:$('suite').value,routes,prompt})});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);$('benchMsg').textContent=`Pi benchmark queued using ${d.prompt_mode} prompt ${d.prompt_hash.slice(0,8)}. Other gateway clients will be held out until both agent runs finish.`}catch(e){$('benchMsg').textContent='Error: '+e.message}finally{$('runBench').disabled=false}}
 function render(d){const h=d.history||[],a=d.active||[],m=d.memory||{},ms=d.models||{},c=d.cache||{},aff=d.route_affinity||{},pin=d.manual_pin||{},b=d.benchmarks||{};$('status').textContent='Updated '+new Date().toLocaleTimeString();$('mem').textContent=val(m.available_gb)+' GiB';$('membar').style.width=Math.max(0,Math.min(100,(m.available_gb/(m.total_gb||1))*100))+'%';$('pressure').textContent=m.hard_pressure?'HARD':m.pressure?'GUARD':'NORMAL';$('pressure').className='v '+(m.hard_pressure?'bad':m.pressure?'warn':'good');$('active').textContent=a.length;$('req').textContent=h.length;const resident=['moe','dense'].filter(k=>ms[k]?.running).join(' + ')||'none';$('backend').textContent=resident.toUpperCase();const tt=h.filter(x=>x.ttft_ms!=null),tp=h.filter(x=>x.gen_tps!=null);$('ttft').textContent=tt.length?sec(tt.reduce((s,x)=>s+x.ttft_ms,0)/tt.length):'—';$('tps').textContent=tp.length?(tp.reduce((s,x)=>s+x.gen_tps,0)/tp.length).toFixed(1)+' t/s':'—';$('cost').textContent=h.reduce((s,x)=>s+(x.compute_score||0),0).toFixed(1);$('cacheEntries').textContent=c.entries||0;$('cacheHits').textContent=c.hits||0;$('pins').textContent='OFF';$('manualPin').textContent='OFF';$('manualPin').className='v good';$('routingState').textContent=d.config?.routing_enabled?'DETERMINISTIC':'DISABLED';
-$('modelRows').innerHTML=Object.entries(ms).map(([k,x])=>`<tr><td>${esc(k)}</td><td>${esc(x.model)}</td><td class=${x.running?'good':'bad'}>${x.running?'RUNNING':'STOPPED'}</td><td>${esc(x.endpoint)}</td></tr>`).join('');$('activeRows').innerHTML=a.map(x=>`<tr><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td><td>${sec(x.ttft_ms)}</td><td>${val(x.memory_available_gb)} GiB</td><td>${Math.round(Date.now()/1000-x.started)}s</td></tr>`).join('')||'<tr><td colspan=6>No active requests</td></tr>';
-$('historyRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.route)}</td><td class=reason>${esc(x.route_reason)}</td><td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${val(x.total_tokens)}</td><td>${x.gen_tps?x.gen_tps.toFixed(1):'—'}</td><td>${val(x.compute_score)}</td><td class=${x.status>=400?'bad':'good'}>${x.status}</td></tr>`).join('')||'<tr><td colspan=10>No requests</td></tr>';$('routeRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.route)}</td><td>${esc(x.task_type||'—')} · ${esc(x.effort||'—')} · thinking ${x.thinking==null?'—':x.thinking?'on':'off'} · ${val(x.effective_max_tokens)} tokens</td><td>${x.router_confidence==null?'—':(x.router_confidence*100).toFixed(0)+'%'}</td><td class=reason>${esc(x.route_reason)}</td><td>${sec(x.router_ms)}</td><td>${x.cache_hit?'HIT':'—'}</td></tr>`).join('');
+$('modelRows').innerHTML=Object.entries(ms).map(([k,x])=>`<tr><td>${esc(k)}</td><td>${esc(x.model)}</td><td class=${x.running?'good':'bad'}>${x.running?'RUNNING':'STOPPED'}</td><td>${esc(x.endpoint)}</td></tr>`).join('');$('activeRows').innerHTML=a.map(x=>`<tr><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td>${x.routing_level==null?'—':'L'+x.routing_level}</td><td>${sec(x.ttft_ms)}</td><td>${val(x.memory_available_gb)} GiB</td><td>${Math.round(Date.now()/1000-x.started)}s</td></tr>`).join('')||'<tr><td colspan=6>No active requests</td></tr>';
+$('historyRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.route)}</td><td class=reason>${esc(x.route_reason)}</td><td>${x.routing_level==null?'—':'L'+x.routing_level}</td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${val(x.total_tokens)}</td><td>${x.gen_tps?x.gen_tps.toFixed(1):'—'}</td><td>${val(x.compute_score)}</td><td class=${x.status>=400?'bad':'good'}>${x.status}</td></tr>`).join('')||'<tr><td colspan=10>No requests</td></tr>';$('routeRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.route)}</td><td>${esc(x.task_type||'—')} · ${esc(x.effort||'—')} · thinking ${x.thinking==null?'—':x.thinking?'on':'off'} · ${val(x.effective_max_tokens)} tokens</td><td>${x.routing_level==null?'—':'L'+x.routing_level}</td><td class=reason>${esc(x.route_reason)}</td><td>${sec(x.router_ms)}</td><td>${x.cache_hit?'HIT':'—'}</td></tr>`).join('');
 const suites=b.suites||{};suiteData=suites;if(!$('suite').options.length){$('suite').innerHTML=Object.entries(suites).map(([id,x])=>`<option value=${esc(id)}>${esc(x.name)} — ${esc(x.description)}</option>`).join('');showPrompt()}const jobs=b.jobs||[];renderLivePi(jobs);$('jobRows').innerHTML=jobs.slice().reverse().map(j=>`<tr><td>${new Date(j.created_at*1000).toLocaleTimeString()}</td><td>${esc(j.suite)}</td><td>${esc(j.routes.join(', '))}</td><td class=${j.status==='failed'?'bad':j.status==='complete'?'good':'warn'}>${esc(j.status)}</td><td>${esc(j.stage||j.current_route||'—')}</td><td>${esc(j.error||j.restore_error||'—')}</td></tr>`).join('')||'<tr><td colspan=6>No benchmark jobs</td></tr>';$('runBench').disabled=a.length>0||jobs.some(j=>['queued','running'].includes(j.status));benchmarkResults=b.history||[];const groups=[...new Set(benchmarkResults.map(x=>x.job_id).filter(Boolean))].reverse();const prior=$('compareJob').value;$('compareJob').innerHTML='<option value="">Choose a completed run</option>'+groups.map(id=>{const x=benchmarkResults.find(r=>r.job_id===id);return `<option value="${esc(id)}">${esc(x?.suite||'benchmark')} · ${new Date((x?.ts||0)*1000).toLocaleString()}</option>`}).join('');if(selectedCompareJob&&groups.includes(selectedCompareJob)){selectComparison(selectedCompareJob)}else if(prior&&groups.includes(prior)){selectComparison(prior)}$('benchRows').innerHTML=benchmarkResults.slice().reverse().map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.suite)}</td><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td><b>${x.evaluation?.readiness_score??'—'}</b>${x.evaluation?' / 100':''}</td><td><button class=action onclick="selectComparison('${esc(x.job_id||'')}')">Compare output</button></td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${sec(x.total_time_ms??(x.latency_ms==null?null:x.latency_ms+(x.swap_ms||0)))}</td><td>${sec(x.latency_ms)}</td><td>${val(x.pi_tool_calls)}</td><td>${val(x.pi_model_requests)}</td><td>${val(x.prompt_tokens)}</td><td>${val(x.completion_tokens)}</td><td>${val(x.average_tps)}</td><td>${val(x.available_before_gb)} → ${val(x.available_after_gb)} GiB</td><td>${x.swap_delta_mb==null?'Unavailable':x.swap_delta_mb+' MB'}</td><td>${val(x.compute_score)}</td></tr>`).join('')||'<tr><td colspan=18>No benchmark results</td></tr>'}
 async function tick(){try{const r=await fetch('/metrics',{cache:'no-store'}),d=await r.json();benchmarkJobs=d.benchmarks?.jobs||[];render(d);enforceComparisonLocks()}catch(e){$('status').textContent='Dashboard error: '+e.message}}setInterval(tick,1200);tick();
 </script></body></html>"""

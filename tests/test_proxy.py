@@ -1,19 +1,18 @@
 """
 Unit tests for core proxy functions.
 """
+import asyncio
+
+import proxy
 from proxy import (
+    MODEL_CAPABILITIES,
     cache_key,
+    capability_adjustment,
     compute_score,
-    conversation_key,
     extract_finish_reason,
     extract_usage,
-    heuristic_policy,
-    is_coding_request,
-    is_explicit_continuation,
     normalize_policy,
-    routing_context,
     stream_delta_text,
-    task_state,
 )
 
 
@@ -195,204 +194,64 @@ class TestNormalizePolicy:
         assert policy["max_tokens"] >= 512
 
 
-class TestHeuristicPolicy:
-    """Tests for heuristic routing policy."""
+class TestCapabilityAdjustment:
+    """Tests for capability-aware route adjustment (vision, context window)."""
 
-    def test_heuristic_policy_simple(self):
-        """Simple request should route to MoE."""
-        body = {
-            "messages": [{"role": "user", "content": "What is the capital of France?"}]
-        }
-        policy = heuristic_policy(body)
-        assert policy["route"] == "moe"
-        assert policy["confidence"] > 0.5
+    def test_vision_switch(self, monkeypatch):
+        monkeypatch.setitem(MODEL_CAPABILITIES, "moe", {"context_window": 128000, "max_output": 32000, "vision": False})
+        monkeypatch.setitem(MODEL_CAPABILITIES, "dense", {"context_window": 128000, "max_output": 32000, "vision": True})
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}]}
+        route, note = capability_adjustment("moe", body)
+        assert route == "dense"
+        assert "vision" in note
 
-    def test_heuristic_policy_coding(self):
-        """Coding request should be detected."""
-        body = {
-            "messages": [{"role": "user", "content": "Build a Python API for user management"}]
-        }
-        policy = heuristic_policy(body)
-        assert policy["route"] in ("moe", "dense")
+    def test_vision_no_capable_model(self, monkeypatch):
+        monkeypatch.setitem(MODEL_CAPABILITIES, "moe", {"context_window": 128000, "max_output": 32000, "vision": False})
+        monkeypatch.setitem(MODEL_CAPABILITIES, "dense", {"context_window": 128000, "max_output": 32000, "vision": False})
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}]}
+        route, note = capability_adjustment("moe", body)
+        assert route == "moe"
+        assert "no vision-capable model" in note
 
-    def test_heuristic_policy_complex(self):
-        """Complex request should route to dense."""
-        body = {
-            "messages": [{"role": "user", "content": "Review the entire codebase for architectural issues"}]
-        }
-        policy = heuristic_policy(body)
+    def test_context_window_switch(self, monkeypatch):
+        monkeypatch.setitem(MODEL_CAPABILITIES, "moe", {"context_window": 1000, "max_output": 32000, "vision": False})
+        monkeypatch.setitem(MODEL_CAPABILITIES, "dense", {"context_window": 128000, "max_output": 32000, "vision": False})
+        body = {"messages": [{"role": "user", "content": "x" * 8000}]}  # ~2000 tokens
+        route, note = capability_adjustment("moe", body)
+        assert route == "dense"
+        assert "window" in note
+
+    def test_no_adjustment_when_fits(self, monkeypatch):
+        monkeypatch.setitem(MODEL_CAPABILITIES, "moe", {"context_window": 128000, "max_output": 32000, "vision": False})
+        monkeypatch.setitem(MODEL_CAPABILITIES, "dense", {"context_window": 128000, "max_output": 32000, "vision": False})
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        route, note = capability_adjustment("moe", body)
+        assert route == "moe"
+        assert note == ""
+
+
+class TestChoosePolicy:
+    """Tests for policy selection including the ROUTING_ENABLED pin."""
+
+    def test_routing_disabled_pins_fallback(self, monkeypatch):
+        monkeypatch.setattr(proxy, "ROUTING_ENABLED", False)
+        body = {"messages": [{"role": "user", "content": "Fix the race condition in my worker pool"}]}
+        policy, _ = asyncio.run(proxy.choose_policy(body))
+        assert policy["route"] == proxy.FALLBACK_ROUTE
+        assert policy["complexity"] is None
+        assert "routing disabled" in policy["reason"]
+
+    def test_routing_enabled_uses_engine(self, monkeypatch):
+        monkeypatch.setattr(proxy, "ROUTING_ENABLED", True)
+        body = {"messages": [{"role": "user", "content": "Fix the race condition in my worker pool"}]}
+        policy, _ = asyncio.run(proxy.choose_policy(body))
         assert policy["route"] == "dense"
-        assert policy["confidence"] > 0.7
-
-    def test_heuristic_policy_failure_recovery(self):
-        """Failed implementation should route to dense."""
-        body = {
-            "messages": [
-                {"role": "user", "content": "Build a Python API"},
-                {"role": "assistant", "content": "Here's the code..."},
-                {"role": "user", "content": "The Python API didn't work, fix it"}
-            ]
-        }
-        policy = heuristic_policy(body)
-        # The failure signal "didn't work" + coding context should trigger dense routing
-        assert policy["route"] == "dense"
-        assert policy["task_type"] == "failure_recovery"
-
-
-class TestIsCodingRequest:
-    """Tests for coding request detection."""
-
-    def test_is_coding_request_true(self):
-        """Should detect coding requests."""
-        body = {
-            "messages": [{"role": "user", "content": "Build a Python function to parse JSON"}]
-        }
-        assert is_coding_request(body) is True
-
-    def test_is_coding_request_false(self):
-        """Should not detect non-coding requests."""
-        body = {
-            "messages": [{"role": "user", "content": "What is the weather like today?"}]
-        }
-        assert is_coding_request(body) is False
-
-    def test_is_coding_request_html(self):
-        """Should detect HTML requests."""
-        body = {
-            "messages": [{"role": "user", "content": "Create an HTML page with a form"}]
-        }
-        assert is_coding_request(body) is True
-
-
-class TestIsExplicitContinuation:
-    """Tests for explicit continuation detection."""
-
-    def test_is_explicit_continuation_true(self):
-        """Should detect continuation phrases."""
-        assert is_explicit_continuation("continue") is True
-        assert is_explicit_continuation("go on") is True
-        assert is_explicit_continuation("keep going") is True
-        assert is_explicit_continuation("proceed") is True
-        assert is_explicit_continuation("resume") is True
-
-    def test_is_explicit_continuation_false(self):
-        """Should not detect non-continuation phrases."""
-        assert is_explicit_continuation("new question") is False
-        assert is_explicit_continuation("hello") is False
-        assert is_explicit_continuation("what is this?") is False
-
-    def test_is_explicit_continuation_case_insensitive(self):
-        """Should be case insensitive."""
-        assert is_explicit_continuation("CONTINUE") is True
-        assert is_explicit_continuation("Continue") is True
-
-
-class TestTaskState:
-    """Tests for task state extraction."""
-
-    def test_task_state_single_user(self):
-        """Should extract state for single user message."""
-        body = {
-            "messages": [{"role": "user", "content": "Hello"}]
-        }
-        state = task_state(body)
-        assert state["user_turn_count"] == 1
-        assert state["message_count"] == 1
-        assert state["latest_user"] == "Hello"
-
-    def test_task_state_multiple_users(self):
-        """Should extract state for multiple user messages."""
-        body = {
-            "messages": [
-                {"role": "user", "content": "First question"},
-                {"role": "assistant", "content": "Answer"},
-                {"role": "user", "content": "Second question"},
-            ]
-        }
-        state = task_state(body)
-        assert state["user_turn_count"] == 2
-        assert state["message_count"] == 3
-        assert state["latest_user"] == "Second question"
-
-    def test_task_state_empty(self):
-        """Should handle empty messages."""
-        body = {"messages": []}
-        state = task_state(body)
-        assert state["user_turn_count"] == 0
-        assert state["message_count"] == 0
-        assert state["latest_user"] == ""
-
-
-class TestConversationKey:
-    """Tests for conversation key generation."""
-
-    def test_conversation_key_deterministic(self):
-        """Same conversation should produce same key."""
-        body1 = {
-            "messages": [
-                {"role": "system", "content": "You are helpful"},
-                {"role": "user", "content": "Hello"},
-            ]
-        }
-        body2 = {
-            "messages": [
-                {"role": "system", "content": "You are helpful"},
-                {"role": "user", "content": "Hello"},
-            ]
-        }
-        assert conversation_key(body1) == conversation_key(body2)
-
-    def test_conversation_key_different(self):
-        """Different conversations should produce different keys."""
-        body1 = {
-            "messages": [{"role": "user", "content": "Hello"}]
-        }
-        body2 = {
-            "messages": [{"role": "user", "content": "Goodbye"}]
-        }
-        assert conversation_key(body1) != conversation_key(body2)
-
-    def test_conversation_key_no_user(self):
-        """Should return None if no user message."""
-        body = {
-            "messages": [{"role": "system", "content": "You are helpful"}]
-        }
-        assert conversation_key(body) is None
-
-
-class TestRoutingContext:
-    """Tests for routing context extraction."""
-
-    def test_routing_context_single_message(self):
-        """Should extract context from single message."""
-        body = {
-            "messages": [{"role": "user", "content": "Hello"}]
-        }
-        context = routing_context(body)
-        assert "USER" in context
-        assert "Hello" in context
-
-    def test_routing_context_multiple_messages(self):
-        """Should extract context from multiple messages."""
-        body = {
-            "messages": [
-                {"role": "user", "content": "First"},
-                {"role": "assistant", "content": "Response"},
-                {"role": "user", "content": "Second"},
-            ]
-        }
-        context = routing_context(body)
-        assert "First" in context
-        assert "Response" in context
-        assert "Second" in context
-
-    def test_routing_context_truncation(self):
-        """Should truncate context if too long."""
-        body = {
-            "messages": [{"role": "user", "content": "x" * 100000}]
-        }
-        context = routing_context(body)
-        assert len(context) <= 25000  # Should be truncated
+        assert policy["complexity"] == 6
 
 
 class TestComputeScore:

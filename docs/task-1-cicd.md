@@ -1,11 +1,10 @@
 # Task 1: CI/CD Pipeline with GitHub Actions
 
-## Status: ✅ COMPLETE
+## Status: ✅ COMPLETE (re-run in CP-1, 2026-09-06)
 
-**Completed:** August 28, 2025  
-**Commit:** `3a0fa14`  
-**Tests:** 90 passing  
-**Coverage:** Core proxy functions, routing, cache, memory, benchmarks
+**Original:** August 28, 2025, commit `3a0fa14` (90 tests)
+**CP-1 re-run:** commit `c500024` — ruff clean (import sorting + semicolon fixes),
+Python matrix 3.12/3.13/3.14, 119 tests passing at CP-1 close, CI green on main.
 
 ## Overview
 

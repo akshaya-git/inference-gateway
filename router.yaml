@@ -1,27 +1,27 @@
-version: 1
+version: 2
 
 routes:
   moe:
     model: mlx-community--Qwen3.6-35B-A3B-6bit
-    judge_name: moe_workhorse
     description: >-
       Qwen MoE workhorse for structured output, tool use, fitness and data analysis,
       summarization, general reasoning, research synthesis, iterative agent work,
       and routine through moderately complex coding, debugging, and feature work.
+    capabilities:
+      context_window: 128000
+      max_output: 32000
+      vision: false
   dense:
     model: scottlowry--Qwen3.8-27B-oQ6e-mtp
-    judge_name: dense_specialist
     description: >-
       High-quality specialist for substantial application or agent builds,
       repository-wide code review, architecture redesign, complex cross-module
       implementation, difficult concurrency or security debugging, and demanding
       code generation where quality is more important than latency.
+    capabilities:
+      context_window: 128000
+      max_output: 32000
+      vision: false
 
 routing:
-  evaluate_every_request: true
-  include_recent_conversation: true
-  include_tool_messages: true
-  include_runtime_state: true
-  prefer_resident_when_similar: true
-  context_characters: 24000
   fallback_route: moe

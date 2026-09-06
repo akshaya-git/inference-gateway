@@ -71,8 +71,8 @@ CI green. No task starts until the previous checkpoint is closed.
 
 | CP | Task | Scope | Entry | Exit (checkpoint) |
 |----|------|-------|-------|-------------------|
-| **CP-1** | **Task 1: CI/CD re-run** | `ci.yml` covers `routing_logic.py`, `routing_rules.json` (validation test), `scripts/stack.py`; ruff clean; 114 unit tests in CI; pre-commit verified | Baseline `d762373` pushed | CI green on main |
-| **CP-2** | **Task 3 rework: routing fixes + rationale** | R1–R8 above; deterministic decision fields (level, matched rules, source, rules_version) in `Metric` + dashboard + `/api/routing-rationale` export | CP-1 closed | Regression tests pass (12 prompts), CI green |
+| **CP-1** ✅ | **Task 1: CI/CD re-run** | `ci.yml` covers `routing_logic.py`, `routing_rules.json` (validation test), `scripts/stack.py`; ruff clean; unit tests in CI; pre-commit verified | Baseline `d762373` pushed | **Closed**: ruff fixes + Python 3.12/3.13/3.14 matrix; CI green on `c500024` |
+| **CP-2** ✅ | **Task 3 rework: routing fixes + rationale** | R1–R8 above; deterministic decision fields (level, matched rules, source, rules_version) in `Metric` + dashboard + `/api/routing-rationale` export | CP-1 closed | **Closed**: rules v2, 12-prompt regression suite, dead code removed, CI green (see CP-2 log below) |
 | **CP-3** | **Task 2: integration re-baseline** | Live stack (oMLX running with both models), 10 integration tests, `benchmark_real.py`, M5 Max 128 GB baselines with Qwen3.6-6bit + Qwen3.8-oQ6e | CP-2 closed (fixed routing before generating data) | Integration tests pass, new baselines committed |
 | **CP-4** | **Task 6 + Task 9: backend abstraction + model swappability** | `BackendInterface` ABC; `OMLXBackend` (OpenAI-compatible chat + admin residency); `OpenAIBackend` (generic — covers MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio); `backends:` config in `router.yaml`; documented model-change procedure + tests (config change, no code change → routes to new model) | CP-3 closed (live stack for validation) | Behavior unchanged via interface; model swap tested; CI green |
 | **CP-5** | **Task 10 (new): multi-axis benchmark lab** | Model dropdown (all backend models, **load-run-unload** residency to preserve RAM); framework dropdown (backends from config); harness dropdown (installed detection) + adapters; 3-axis results (model × framework × harness) with backend/harness columns | CP-4 closed | Any model × framework × installed harness runnable; RAM preserved; CI green |
@@ -134,9 +134,9 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
 
 | # | Task | File | Status |
 |---|------|------|--------|
-| 1 | CI/CD Pipeline | [docs/task-1-cicd.md](docs/task-1-cicd.md) | 🔄 re-run in CP-1 |
+| 1 | CI/CD Pipeline | [docs/task-1-cicd.md](docs/task-1-cicd.md) | ✅ closed in CP-1 (`c500024`, CI green) |
 | 2 | Testing Environment | [docs/task-2-testing.md](docs/task-2-testing.md) | 🔄 re-baseline in CP-3 |
-| 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | 🔄 reworked in CP-2 (deterministic decisions + R1–R8) |
+| 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | ✅ closed in CP-2 (rules v2, R1–R8, rationale capture) |
 | 4 | Benchmark Suites | [docs/task-4-benchmarks.md](docs/task-4-benchmarks.md) | ✅ core done (5 artifact suites); live runs in CP-3/CP-5 |
 | 5 | Cache Enhancement | [docs/task-5-cache.md](docs/task-5-cache.md) | ⬜ CP-6 |
 | 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | 🔄 CP-4 (absorbs Task 9) |
@@ -149,7 +149,37 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
 
 - **Restart the proxy after code upgrades** — routing behavior and model residency are read at startup
 - **Gateway code changes are routed to the dense model** (`gateway-dense`)
-- Known cleanup candidates (dead code from judge removal): `router_request_context()`,
-  `last_user_text()` in proxy.py; `judge_model: None` metrics field — remove in CP-2
+- Dead judge-era code removed in CP-2: `router_request_context()`, `last_user_text()`,
+  `message_text()`, `conversation_key()`, `routing_context()`, `task_routing_context()`,
+  `task_state()`, `is_explicit_continuation()`, `is_coding_request()`,
+  `enforce_capability_floors()`, `heuristic_policy()` in proxy.py; `judge_model: None`
+  metrics field; `tests/test_routing.py` (tested only dead functions)
 - Current environment: oMLX running on :8000 with both models loaded; M5 Max 128 GB;
-  Python 3.14.7 in `.venv`; 114/114 unit tests passing
+  Python 3.14.7 in `.venv`; 113 unit tests passing (10 integration deselected)
+
+## CP-2 completion log (2026-09-06)
+
+- **Rules v2** (`routing_rules.json`): expanded `code_terms` (languages, frameworks,
+  artifacts, technical verbs, infra); benchmark vocabulary removed (R7); no auth terms,
+  no postgres terms (owner scope); `function` dropped from code terms (liver false
+  positive); new base rules: `concurrency`, `data_migration`, `security`, `system`
+  (L6), `integration` (L5), `stateful` (L4), `small` (L2), `mechanical` (L1).
+- **Matching engine** (`routing_logic.py`): stemmed token-set containment with phrase
+  variants (R2); code gate decoupled from rule matching (R3); `dense_above` configurable
+  1-5 + optional `level_routes` map (R4); invalid controls stripped + reported, never
+  clamped/forwarded (R6); `strip_routing_controls` strips all text parts.
+- **Capability metadata** (R5): `capabilities` per route in `router.yaml` (context
+  window, max output, vision); `capability_adjustment()` switches route for image
+  content / oversized prompts when a capable model exists; gaps noted in reason.
+- **Rationale capture**: `Metric.routing_level` + `Metric.routing_rules`; dashboard
+  shows Level + reason (matched rules) instead of fake confidence; new
+  `GET /api/routing-rationale` export endpoint; `judge_model: None` removed from metrics.
+- **ROUTING_ENABLED** now actually pins to the fallback route (was reported-only).
+- **12-prompt regression suite** in `tests/test_routing_logic.py` — all pass:
+  race condition → L6 dense; system redesign → L6 dense; DB migration → L6 dense;
+  security review → L6 dense; todo app → L3 moe; liver question → L1 moe (not code);
+  `[complexity:7]` → stripped + reported; auth prompt → L3 moe (auth out of scope).
+- **Documented behavior change**: "Build polished browser Tetris" is now L4 moe
+  (was L5 dense via benchmark vocabulary). Benchmark runs use explicit aliases, so
+  benchmark data is unaffected.
+- Tests: 113 passed, 10 deselected (CI-equivalent). Ruff clean.

@@ -1,19 +1,28 @@
 {
-  "version": 1,
+  "version": 2,
   "dense_above": 4,
   "levels": {"1":"Mechanical edit", "2":"Small implementation", "3":"Self-contained feature", "4":"Complex stateful feature", "5":"Demanding integration", "6":"System-level change"},
-  "code_terms": ["code", "html", "svg", "css", "javascript", "python", "function", "script", "api", "database", "tetris", "kanban", "dashboard", "visualizer", "frontend", "backend", "refactor", "bug", "test"],
+  "code_terms": [
+    "python", "javascript", "typescript", "java", "rust", "golang", "ruby", "php", "swift", "kotlin", "scala", "sql", "bash", "shell", "html", "css", "json", "yaml", "regex",
+    "react", "vue", "svelte", "node", "npm", "pip", "flask", "django", "fastapi", "express", "pandas", "numpy", "pytorch", "tensorflow", "docker", "kubernetes", "git", "github", "sqlite", "eslint", "pytest", "jest",
+    "code", "class", "module", "package", "library", "script", "app", "application", "website", "webpage", "page", "browser", "component", "endpoint", "api", "server", "client", "database", "query", "table", "schema", "migration", "algorithm", "parser", "compiler", "bot", "cli", "plugin", "extension", "widget", "form", "button", "layout", "style", "theme", "animation", "chart", "graph", "visualization", "transformer",
+    "implement", "refactor", "debug", "optimize", "deploy", "migrate", "integrate", "compile", "parse", "benchmark", "profile", "develop", "architect", "prototype", "extend", "rewrite", "restructure", "convert", "transform", "scale", "patch", "upgrade", "audit", "review", "test", "lint", "redesign",
+    "thread", "threading", "async", "await", "concurrency", "concurrent", "parallel", "queue", "worker", "cache", "memory", "performance", "latency", "throughput", "timeout", "retry", "webhook", "socket", "websocket", "http", "rest", "graphql", "grpc", "microservice", "container", "cluster", "process", "daemon", "cron", "pipeline", "workflow", "security", "vulnerability", "pull request"
+  ],
   "base_rules": [
-    {"id":"mechanical", "level":1, "terms":["rename a variable", "change a color", "fix a typo", "change this button"]},
-    {"id":"small", "level":2, "terms":["one function", "small script", "input validation"]},
-    {"id":"stateful", "level":4, "terms":["tetris", "kanban", "dashboard", "visualizer", "state machine"]},
-    {"id":"integration", "level":5, "terms":["frontend and backend", "authentication", "backward-compatible api"]},
-    {"id":"system", "level":6, "terms":["cross-service", "database migration", "concurrency repair", "security repair", "system redesign"]}
+    {"id": "mechanical", "level": 1, "terms": ["rename a variable", "change a color", "fix a typo", "change this button", "typo", "rename"]},
+    {"id": "small", "level": 2, "terms": ["small script", "input validation", "validate input", "unit test", "one liner", "one-liner"]},
+    {"id": "stateful", "level": 4, "terms": ["state machine", "finite state machine", "game loop", "game state", "undo redo", "drag and drop"]},
+    {"id": "integration", "level": 5, "terms": ["frontend and backend", "front end and back end", "backward-compatible api", "third-party api", "external api", "payment processing", "payment integration"]},
+    {"id": "concurrency", "level": 6, "terms": ["race condition", "race conditions", "deadlock", "concurrency bug", "concurrency repair", "thread safety", "thread-safe", "data race", "concurrent access"]},
+    {"id": "data_migration", "level": 6, "terms": ["database migration", "migrate my database", "migrate the database", "migrate database", "data migration", "schema migration"]},
+    {"id": "security", "level": 6, "terms": ["security repair", "security issue", "security issues", "security review", "security vulnerability", "security fix", "vulnerability", "exploit", "injection attack", "xss", "csrf"]},
+    {"id": "system", "level": 6, "terms": ["cross-service", "system redesign", "redesign the system", "redesign my system", "architect the system", "system architecture", "distributed system", "10x traffic", "scale to production"]}
   ],
   "modifiers": [
-    {"id":"visual_polish", "terms":["polished", "visual polish", "beautiful", "detailed portrait"]},
-    {"id":"accessibility", "terms":["accessible", "accessibility", "screen reader"]},
-    {"id":"edge_cases", "terms":["demanding edge cases", "all edge cases", "race conditions"]},
-    {"id":"compatibility", "terms":["backward compatibility", "backwards compatible"]}
+    {"id": "visual_polish", "terms": ["polished", "visual polish", "beautiful", "detailed portrait", "pixel perfect", "pixel-perfect"]},
+    {"id": "accessibility", "terms": ["accessible", "accessibility", "screen reader", "aria labels", "wcag"]},
+    {"id": "edge_cases", "terms": ["demanding edge cases", "all edge cases", "edge cases", "boundary conditions"]},
+    {"id": "compatibility", "terms": ["backward compatibility", "backwards compatible", "backward compatible", "legacy support"]}
   ]
 }
