@@ -1,10 +1,8 @@
 # Inference Gateway — Development Plan
 
-> **Updated 2026-09-05 (rev 2)** — Architecture changed: the judge model is **dropped entirely**
-> (no longer in `router.yaml` or `proxy.py`), routing is now **deterministic** (score/level lookup),
-> and the MoE workhorse is **Qwen3.6-35B-A3B 6-bit** (Kimi was tried and dropped — the current
-> oMLX setup keeps only the dense model resident, leaving more memory headroom).
-> All tasks are re-baselined below. Task 1 is ready to re-run.
+> **Updated 2026-09-05 (rev 3)** — Checkpointed execution plan. Judge model dropped entirely;
+> deterministic score/level routing; MoE workhorse = Qwen3.6-35B-A3B-6bit; dense = Qwen3.8-27B-oQ6e.
+> Tasks run **strictly in sequence**, each ending in a checkpoint (commit + push + CI green).
 > **Policy:** gateway code changes are handled by the dense model (`gateway-dense`).
 
 ## Architecture Change Log (2026-09-05)
@@ -12,171 +10,131 @@
 | Area | Before | After |
 |------|--------|-------|
 | Routing | Arch-Router-1.5B judge model, semantic per-request inference | **Deterministic** `RoutingEngine` (`routing_logic.py` + versioned `routing_rules.json`): 6 complexity levels, code-term gate, base rules + modifiers; code above level 4 → dense, everything else → MoE |
-| MoE workhorse | Qwen3.6-35B-A3B-oQ5e-mtp | **mlx-community--Qwen3.6-35B-A3B-6bit** (Kimi Linear 48B was tried, then dropped) |
+| MoE workhorse | Qwen3.6-35B-A3B-oQ5e-mtp | **mlx-community--Qwen3.6-35B-A3B-6bit** (Kimi was tried, then dropped) |
 | Dense specialist | Qwen3.8-27B-oQ4e-mtp | scottlowry--Qwen3.8-27B-oQ6e-mtp |
-| Judge model | Loaded, reloaded if evicted, judged every auto request | **Dropped entirely** — `judge:` section removed from `router.yaml`; all `JUDGE_CONFIG`/`ROUTER_MODEL` code removed from `proxy.py`; can be unloaded in oMLX and is never reloaded |
-| oMLX | Server on :8080, stack script swapped models | oMLX **app** on **:8000** (admin API used directly); `scripts/stack.py` lifecycle |
-| Model residency | One large model resident; swap on route change | **`KEEP_MODELS_LOADED=true`** default — both large models stay loaded; route changes never unload the other (set `false` for old behavior; current setup runs dense-only for memory headroom) |
-| Model switching | Subprocess call to `inference-stack.sh` | Gateway control API (`/control/model/{route}`) + oMLX admin load/unload with transition waits; fail-closed on admin errors |
-| Context/output | 131,072 ctx / 32,144 out | 128,000 ctx / 32,000 out (advertised on all aliases) |
-| Benchmark suites | 3 Pi-session suites (quick, coding_hitl, reasoning) | +5 artifact suites: **browser_tetris, svg_portrait, kanban_board, csv_dashboard, pathfinding_visualizer** (HTML/SVG artifacts, human verdicts) |
-| TPS metric | Mean of per-call rates | **Time-weighted** average generation TPS (tokens / summed generation ms) |
-| Rules management | n/a | `GET/PUT /routing/rules` (validated, versioned, atomic); human verdicts journal to `.inference-stack/routing-feedback.jsonl` |
-| Pi integration | `local-mlx` provider | `mlx-proxy` provider (`docs/pi-models.json`, `docs/pi-settings.json`); aliases `gateway-auto` / `gateway-moe` / `gateway-dense` |
-| Auth | none | Optional `OMLX_API_KEY` bearer header for all upstream calls |
+| Judge model | Loaded, reloaded if evicted, judged every auto request | **Dropped entirely** — no `judge:` section, no judge code; unloadable in oMLX, never reloaded |
+| oMLX | Server on :8080, stack script swapped models | oMLX **app** on **:8000** (OpenAI-compatible + admin API); `scripts/stack.py` lifecycle |
+| Model residency | One large model resident; swap on route change | **`KEEP_MODELS_LOADED=true`** default — both large models stay loaded; `false` restores swap behavior |
+| Model switching | Subprocess call to `inference-stack.sh` | Gateway control API + oMLX admin load/unload with transition waits; fail-closed |
+| Context/output | 131,072 ctx / 32,144 out | 128,000 ctx / 32,000 out |
+| Benchmark suites | 3 Pi-session suites | +5 artifact suites (tetris, svg portrait, kanban, csv dashboard, pathfinding) + SVG endpoint + time-weighted TPS |
+| Rules management | n/a | `GET/PUT /routing/rules` (validated, versioned, atomic); verdicts journal `.inference-stack/routing-feedback.jsonl` |
+| Pi integration | `local-mlx` provider | `mlx-proxy` provider; aliases `gateway-auto` / `gateway-moe` / `gateway-dense` |
+| Auth | none | Optional `OMLX_API_KEY` bearer header |
 
-### Deterministic routing (replaces the judge)
+### Route naming (why results say "moe"/"dense")
 
-- `routing_rules.json` (versioned lookup): `code_terms`, `base_rules` (level 1–6), `modifiers`
-  (max 2 counted, level capped at 6), `dense_above: 4`.
-- Decision = explicit alias > `[model:…]` control > `[complexity:N]` control > level lookup.
-  Controls are stripped before the request is forwarded.
-- Decisions are sticky per user-message history (survives tool turns and rule reloads);
-  bounded 512-task memory; "continue"-style messages retain the prior decision.
-- Invalid rule edits keep the last valid lookup; error surfaced in `/metrics`.
-- **Model changes are a supported pipeline function**: route → model mapping lives only in
-  `router.yaml` + env overrides (`MOE_MODEL`, `DENSE_MODEL`); see Task 9.
+`moe` and `dense` are **route names** — stable labels for the two backends — not model names.
+`moe` = the MoE-architecture workhorse (currently Qwen3.6-35B-A3B-6bit, 3B active params);
+`dense` = the dense-architecture specialist (currently Qwen3.8-27B-oQ6e). Names survive model
+swaps; a request shows "moe" when its computed level ≤ `dense_above` (default 4).
 
-## Task Dependency Chart
+## Known Routing Gaps (verified 2026-09-05, fixed in CP-2)
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Task Dependency Graph                                 │
-│                                                                         │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
-│  │  Task 1  │    │  Task 2  │    │  Task 3  │    │  Task 4  │         │
-│  │  CI/CD   │    │  Testing │    │  Rationale│   │  Benchmarks│        │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘         │
-│       │               │               │               │                │
-│       ▼               ▼               ▼               ▼                │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
-│  │  Task 5  │    │  Task 6  │    │  Task 7  │    │  Task 9  │         │
-│  │  Cache   │    │  Backend │    │  Refine  │    │  Model   │         │
-│  └──────────┘    └──────────┘    └──────────┘    │  Swappab.│         │
-│       │               │               │          └──────────┘         │
-│       │               │               │               │                │
-│       └───────────────┴───────────────┴───────────────┘                │
-│                               │                                         │
-│                               ▼                                         │
-│                      ┌─────────────────┐                               │
-│                      │  Task 8: Release│                               │
-│                      └─────────────────┘                               │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Live test of the current rules showed dense is almost unreachable:
 
-## Dependency Matrix
+| Prompt | Current | Problem |
+|---|---|---|
+| "Add authentication with JWT to my flask app" | L1, moe | code gate vetoed the level-5 "authentication" rule |
+| "Fix the race condition in my worker pool" | L1, moe | "race conditions" (plural) ≠ "race condition"; no code term |
+| "Redesign the system to handle 10x traffic" | L1, moe | "system redesign" ≠ "redesign the system" |
+| "Migrate my database from sqlite to postgres" | L3, moe | "database migration" ≠ "migrate my database" |
+| "Build a todo list app" | L1, moe | "app" not a code term |
+| "Review my pull request for security issues" | L1, moe | "security repair" ≠ "security issues" |
+| "What is the function of the liver?" | L3, code=True | "function" false-positives as code |
+| "[complexity:7] write code" | control ignored, raw tag forwarded | invalid controls not handled |
 
-| Task | Depends On | Blocks | Can Start |
-|------|-----------|--------|-----------|
-| Task 1: CI/CD | None | Task 8 | Immediately |
-| Task 2: Testing | None | Task 6, Task 8, Task 9 | Immediately |
-| Task 3: Rationale | None | Task 7 | Immediately |
-| Task 4: Benchmarks | None | Task 7, Task 8 | Immediately |
-| Task 5: Cache | None | Task 8 | Immediately |
-| Task 6: Backend | Task 2 | Task 8 | After Task 2 |
-| Task 7: Refinement | Task 3, Task 4 | Task 8 | After Task 3 & 4 |
-| Task 9: Model Swappability | Task 2 | Task 8 | After Task 2 |
-| Task 8: Release | All tasks | None | After all complete |
+**Fixes (R1–R8), scoped per owner decisions:**
+- R1: expand `code_terms` (~60-100 real terms: languages, frameworks, artifacts, task verbs).
+  **Excluded for now:** authentication terms (revisit later), postgres (sqlite is fine — `sqlite`
+  is a code term).
+- R2: robust matching — multiple phrase variants per rule + stemmed token-set matching
+  ("migrat"+"databas" → migration rule).
+- R3: decouple gate from rules — base rules match even without the code gate; the gate sets the
+  *default* level, it does not veto rules.
+- R4: `dense_above` + level→route map configurable in `routing_rules.json` (drop `==4` hardcode).
+- R5: capability metadata in `router.yaml` (context window, vision, max output per model);
+  image requests route to vision-capable models; context-window check.
+- R6: bug fixes — `ROUTING_ENABLED=false` pins to `fallback_route` (or remove flag); invalid
+  controls (`[complexity:7]`) are **stripped + warned** (surfaced in reason/metrics), never
+  forwarded raw and never clamped; `strip_routing_controls` strips all text parts; dashboard
+  shows "Level N · matched rules" instead of fake 100% confidence.
+- R7: remove benchmark vocabulary (tetris/kanban/dashboard/visualizer) from production rules.
+- R8: the 12 prompts above become regression tests in `test_routing_logic.py`.
+  Expected after fixes: "review my pull request for security issues" → L5-6 dense (security
+  terms + variants); "[complexity:7] write code" → control stripped, warned, scored normally.
 
-## Task Summary
+## Checkpointed Task Sequence
 
-| # | Task | File | Effort | Status |
-|---|------|------|--------|--------|
-| 1 | CI/CD Pipeline (re-run on new code) | [docs/task-1-cicd.md](docs/task-1-cicd.md) | 1-2 days | 🔄 **Re-run needed** — CI must cover `routing_logic.py`, `routing_rules.json`, `scripts/stack.py`, 114 unit tests |
-| 2 | Testing Environment | [docs/task-2-testing.md](docs/task-2-testing.md) | 1-2 days | 🔄 **Re-baseline** — new models (Qwen3.6-35B-A3B-6bit / Qwen3.8-27B-oQ6e), oMLX app :8000, M5 Max 128 GB; 10 integration tests + benchmarks to re-run |
-| 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | 1 day | 🔄 **Redesigned** — no judge raw output anymore; capture deterministic decision (level, matched rules, source, rules_version) + feedback journal; export endpoint |
-| 4 | Benchmark Suites | [docs/task-4-benchmarks.md](docs/task-4-benchmarks.md) | 2-3 days | ✅ **Core done** — 5 new artifact suites implemented (tetris, svg portrait, kanban, csv dashboard, pathfinding) + SVG artifact endpoint + time-weighted TPS; remaining: run on live stack, human verdicts |
-| 5 | Cache Enhancement | [docs/task-5-cache.md](docs/task-5-cache.md) | 1-2 days | ⬜ Not started — cache still exact-match only |
-| 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | 2-3 days | 🔄 **Partially achieved** — oMLX admin API used directly, `OMLX_API_KEY`, config-driven model IDs; still no `BackendInterface` ABC/adapters |
-| 7 | Instruction Refinement | [docs/task-7-refinement.md](docs/task-7-refinement.md) | 1-2 days | 🔄 **Redesigned** — no judge prompt to refine; now refine `routing_rules.json` (terms/levels) from benchmark verdicts via `RoutingEngine.update_rules()` / `PUT /routing/rules` |
-| 9 | Model Swappability | (new — see below) | 1 day | ⬜ Not started — make model changes a first-class, tested, documented pipeline function |
-| 8 | Open Source Release | [docs/task-8-release.md](docs/task-8-release.md) | 1-2 days | ⬜ Not started — depends on all of the above |
+All tasks run **in sequence**. Each checkpoint = work complete + tests pass + commit + push +
+CI green. No task starts until the previous checkpoint is closed.
 
-**Total: 9-15 days**
+| CP | Task | Scope | Entry | Exit (checkpoint) |
+|----|------|-------|-------|-------------------|
+| **CP-1** | **Task 1: CI/CD re-run** | `ci.yml` covers `routing_logic.py`, `routing_rules.json` (validation test), `scripts/stack.py`; ruff clean; 114 unit tests in CI; pre-commit verified | Baseline `d762373` pushed | CI green on main |
+| **CP-2** | **Task 3 rework: routing fixes + rationale** | R1–R8 above; deterministic decision fields (level, matched rules, source, rules_version) in `Metric` + dashboard + `/api/routing-rationale` export | CP-1 closed | Regression tests pass (12 prompts), CI green |
+| **CP-3** | **Task 2: integration re-baseline** | Live stack (oMLX running with both models), 10 integration tests, `benchmark_real.py`, M5 Max 128 GB baselines with Qwen3.6-6bit + Qwen3.8-oQ6e | CP-2 closed (fixed routing before generating data) | Integration tests pass, new baselines committed |
+| **CP-4** | **Task 6 + Task 9: backend abstraction + model swappability** | `BackendInterface` ABC; `OMLXBackend` (OpenAI-compatible chat + admin residency); `OpenAIBackend` (generic — covers MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio); `backends:` config in `router.yaml`; documented model-change procedure + tests (config change, no code change → routes to new model) | CP-3 closed (live stack for validation) | Behavior unchanged via interface; model swap tested; CI green |
+| **CP-5** | **Task 10 (new): multi-axis benchmark lab** | Model dropdown (all backend models, **load-run-unload** residency to preserve RAM); framework dropdown (backends from config); harness dropdown (installed detection) + adapters; 3-axis results (model × framework × harness) with backend/harness columns | CP-4 closed | Any model × framework × installed harness runnable; RAM preserved; CI green |
+| **CP-6** | **Task 5: cache enhancement** | Semantic dedup + warming + `/api/cache/analytics` + dashboard | CP-5 closed | Tests pass, CI green |
+| **CP-7** | **Task 7: refinement loop** | Refine `routing_rules.json` (terms/levels) from benchmark verdicts via `update_rules()` / `PUT /routing/rules`; analyzer + generator + endpoints | CP-6 closed (needs CP-2 decision data + CP-5 verdicts) | Loop demonstrated end-to-end, CI green |
+| **CP-8** | **Task 8: open source release** | MIT LICENSE, CONTRIBUTING, CODE_OF_CONDUCT, packaging-ready `pyproject.toml`, issue/PR templates, README polish, release checklist | CP-7 closed | Release candidate tagged |
 
-### Task 9: Model Swappability (new)
+**Total: ~3-4 weeks sequential.**
 
-The MoE model already changed Qwen3.6-oQ5e → Kimi → Qwen3.6-6bit and will change again. Model
-changes must be a **supported function of the pipeline**, not a code edit:
+### CP-5 detail: frameworks and harnesses
 
-1. Route → model mapping only in `router.yaml` (+ `MOE_MODEL`/`DENSE_MODEL` env overrides); no
-   model IDs hardcoded in logic, tests, or docs that drive behavior.
-2. Documented change procedure: update `router.yaml` → restart gateway (or hot path via admin
-   API) → verify with `/health`, `/metrics`, `scripts/stack.py status`.
-3. Tests: alias/route resolution follows config; a config change with no code change routes to
-   the new model (mock oMLX).
-4. README "Changing models" section; release notes template includes model changes.
+**Frameworks (backends):**
 
-## Agentic Pipeline Overview
+| Framework | Install | Adapter | Notes |
+|-----------|---------|---------|-------|
+| oMLX | already installed/running | `OMLXBackend` (OpenAI-compatible + admin load/unload) | jundot/omlx; only backend with gateway-managed residency |
+| Ollama | `brew install ollama` | `OpenAIBackend` | lowest-friction second backend; auto model lifecycle |
+| llama.cpp | `brew install llama-brew` | `OpenAIBackend` | GGUF quantization axis |
+| MLX | `pip install mlx-lm` | `OpenAIBackend` | raw MLX baseline (measures oMLX overhead) |
 
-Each task is executed by a team of agents working in a pipeline:
+**Harnesses (agents):**
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Agentic Development Pipeline                        │
-│                                                                         │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                │
-│  │  Developer  │───▶│  Tester     │───▶│  Engineer   │───▶┌────────┐ │
-│  │  Agent      │    │  Agent      │    │  Agent      │    │  QA    │ │
-│  └─────────────┘    └─────────────┘    └─────────────┘    │  Agent │ │
-│        │                    │                    │          └────────┘ │
-│        ▼                    ▼                    ▼               │     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │     │
-│  │  Write code │    │  Run tests  │    │  Deploy &   │          │     │
-│  │  + docs     │    │  locally    │    │  verify     │          │     │
-│  └─────────────┘    └─────────────┘    └─────────────┘          │     │
-│        │                    │                    │               │     │
-│        └────────────────────┴────────────────────┘───────────────┘     │
-│                              │                                          │
-│                              ▼                                          │
-│                     ┌─────────────────┐                                │
-│                     │  Final Review   │                                │
-│                     │  + Merge        │                                │
-│                     └─────────────────┘                                │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Harness | Repo | Install | Adapter notes |
+|---------|------|---------|---------------|
+| Pi | (installed) | — | existing `run_pi_benchmark` |
+| none (raw) | — | — | **control**: direct chat completion, no agent — isolates model quality from harness quality |
+| omp (oh-my-pi) | can1357/oh-my-pi | `brew install can1357/tap/omp` | Pi fork — adapter closely mirrors the Pi adapter (same provider config style) |
+| deepseek-harness (`dsh`) | deepseek-ai/deepseek-harness | `npx @deepseek-ai/dsh` (Node.js) | developer preview, breaking changes; Web UI on :3080 — headless/CLI mode must be investigated first |
+| oh-my-opencode (Sisyphus) | rooftop-Owl/oh-my-opencode (upstream: code-yeongyu/oh-my-opencode) | opencode CLI + plugin | plugin layer for opencode; install opencode first, then the plugin |
 
-### Agent Roles
+Dropped: Cline, OpenHands (owner decision). "bionic" — dropped unless owner revives it.
 
-| Agent | Responsibility | Tools |
-|-------|---------------|-------|
-| **Developer** | Write code, create docs, implement features | `write`, `edit` |
-| **Tester** | Run tests, verify behavior, check edge cases | `bash` (pytest, curl) |
-| **Engineer** | Deploy, verify integration, check CI | `bash` (git, curl) |
-| **QA** | Final review, check for regressions, approve | `read`, `bash` |
+**Benchmark job schema:** `{suite, backend, harness, models: [...], residency: load_run_unload|keep, prompt}`.
+Harness talks **directly to the selected framework endpoint** (gateway orchestrates + measures,
+does not sit in the inference path, so routing can't interfere with explicit model selection).
+Load-run-unload is the default for benchmark models; the two routing models stay resident.
 
-## Execution Order
+**Installation policy:** the agent installs and configures frameworks/harnesses as needed
+(brew/npm/pip/npx), verifies each with a smoke run against the local endpoint before enabling it
+in the dropdown, and records the exact commands in the task doc for reproducibility. Anything
+requiring GUI interaction or credentials is handed to the owner as explicit commands.
 
-### Phase 1: Re-baseline (Week 1)
-1. **Task 1: CI/CD (re-run)** — CI green on the new deterministic-routing codebase (114 unit tests)
-2. **Task 2: Testing** — start oMLX app + gateway on this machine (dense model resident; more
-   memory headroom than the two-large-model setup), run 10 integration tests, regenerate M5 Max
-   baselines with Qwen3.6-35B-A3B-6bit + Qwen3.8-27B-oQ6e
+## Task Reference
 
-### Phase 2: Core Features (Week 2)
-3. **Task 3: Rationale** — deterministic decision capture + feedback journal export
-4. **Task 4: Benchmarks** — run the 5 new artifact suites on the live stack, collect human verdicts
-5. **Task 5: Cache** — semantic dedup + analytics
-
-### Phase 3: Advanced Features (Week 3)
-6. **Task 6: Backend** — `BackendInterface` ABC + adapters
-7. **Task 7: Refinement** — rules refinement loop from verdicts
-8. **Task 9: Model Swappability** — config-driven model changes, tested + documented
-
-### Phase 4: Release (Week 4)
-9. **Task 8: Release** — prepare for open source
+| # | Task | File | Status |
+|---|------|------|--------|
+| 1 | CI/CD Pipeline | [docs/task-1-cicd.md](docs/task-1-cicd.md) | 🔄 re-run in CP-1 |
+| 2 | Testing Environment | [docs/task-2-testing.md](docs/task-2-testing.md) | 🔄 re-baseline in CP-3 |
+| 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | 🔄 reworked in CP-2 (deterministic decisions + R1–R8) |
+| 4 | Benchmark Suites | [docs/task-4-benchmarks.md](docs/task-4-benchmarks.md) | ✅ core done (5 artifact suites); live runs in CP-3/CP-5 |
+| 5 | Cache Enhancement | [docs/task-5-cache.md](docs/task-5-cache.md) | ⬜ CP-6 |
+| 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | 🔄 CP-4 (absorbs Task 9) |
+| 7 | Instruction Refinement | [docs/task-7-refinement.md](docs/task-7-refinement.md) | 🔄 reworked in CP-7 (refine rules, not judge prompt) |
+| 9 | Model Swappability | — | absorbed into Task 6 / CP-4 |
+| 10 | Multi-axis Benchmark Lab | (new doc in CP-5) | ⬜ CP-5 |
+| 8 | Open Source Release | [docs/task-8-release.md](docs/task-8-release.md) | ⬜ CP-8 |
 
 ## Notes
 
-- Tasks 1, 2, 3, 4, 5 are independent and can be worked on in parallel
-- Task 6 and Task 9 require Task 2 (live stack) for validation
-- Task 7 requires Task 3 (decision data) and Task 4 (benchmark verdicts)
-- Task 8 requires all other tasks to be complete
-- Each task file is self-contained with architecture diagrams, step-by-step instructions, and
-  agentic pipeline explanations
-- **Restart the proxy after code upgrades** — routing behavior and model residency are read at
-  startup; the old judge can be unloaded in oMLX and will not be reloaded
-- **Gateway code changes are routed to the dense model** (`gateway-dense`) — keep this in mind
-  when the gateway is used to develop the gateway itself
-- Known cleanup candidates (dead code from the judge removal): `router_request_context()`,
-  `last_user_text()` in proxy.py; `judge_model: None` metrics field
+- **Restart the proxy after code upgrades** — routing behavior and model residency are read at startup
+- **Gateway code changes are routed to the dense model** (`gateway-dense`)
+- Known cleanup candidates (dead code from judge removal): `router_request_context()`,
+  `last_user_text()` in proxy.py; `judge_model: None` metrics field — remove in CP-2
+- Current environment: oMLX running on :8000 with both models loaded; M5 Max 128 GB;
+  Python 3.14.7 in `.venv`; 114/114 unit tests passing
