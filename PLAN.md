@@ -75,7 +75,7 @@ CI green. No task starts until the previous checkpoint is closed.
 | **CP-2** ✅ | **Task 3 rework: routing fixes + rationale** | R1–R8 above; deterministic decision fields (level, matched rules, source, rules_version) in `Metric` + dashboard + `/api/routing-rationale` export | CP-1 closed | **Closed**: rules v2, 12-prompt regression suite, dead code removed, CI green (see CP-2 log below) |
 | **CP-3** ✅ | **Task 2: integration re-baseline** | Live stack (oMLX running with both models), 10 integration tests, `benchmark_real.py`, M5 Max 128 GB baselines with Qwen3.6-6bit + Qwen3.8-oQ6e | CP-2 closed (fixed routing before generating data) | **Closed**: gateway cutover to project folder, 10/10 integration tests, M5 Max baselines committed (see CP-3 log below) |
 | **CP-4** ✅ | **Task 6 + Task 9: backend abstraction + model swappability** | `BackendInterface` ABC; `OMLXBackend` (OpenAI-compatible chat + admin residency); `OpenAIBackend` (generic — covers MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio); `backends:` config in `router.yaml`; documented model-change procedure + tests (config change, no code change → routes to new model) | CP-3 closed (live stack for validation) | **Closed**: `backends.py` + `derive_route_state()` seam, 127 tests, live restart verified (see CP-4 log below) |
-| **CP-5** | **Task 10 (new): multi-axis benchmark lab** | Model dropdown (all backend models, **load-run-unload** residency to preserve RAM); framework dropdown (backends from config); harness dropdown (installed detection) + adapters; 3-axis results (model × framework × harness) with backend/harness columns | CP-4 closed | Any model × framework × installed harness runnable; RAM preserved; CI green |
+| **CP-5** ✅ | **Task 10 (new): multi-axis benchmark lab** | Model dropdown (all backend models, **load-run-unload** residency to preserve RAM); framework dropdown (backends from config); harness dropdown (installed detection) + adapters; 3-axis results (model × framework × harness) with backend/harness columns | CP-4 closed | **Closed**: `benchmark_lab.py` (4 frameworks × 5 harnesses), `/lab/*` API + 3-Axis Lab dashboard tab, all cells smoke-tested (see CP-5 log below) |
 | **CP-6** | **Task 5: cache enhancement** | Semantic dedup + warming + `/api/cache/analytics` + dashboard | CP-5 closed | Tests pass, CI green |
 | **CP-7** | **Task 7: refinement loop** | Refine `routing_rules.json` (terms/levels) from benchmark verdicts via `update_rules()` / `PUT /routing/rules`; analyzer + generator + endpoints | CP-6 closed (needs CP-2 decision data + CP-5 verdicts) | Loop demonstrated end-to-end, CI green |
 | **CP-8** | **Task 8: open source release** | MIT LICENSE, CONTRIBUTING, CODE_OF_CONDUCT, packaging-ready `pyproject.toml`, issue/PR templates, README polish, release checklist | CP-7 closed | Release candidate tagged |
@@ -142,7 +142,7 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
 | 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | ✅ implemented in CP-4 (absorbs Task 9) |
 | 7 | Instruction Refinement | [docs/task-7-refinement.md](docs/task-7-refinement.md) | 🔄 reworked in CP-7 (refine rules, not judge prompt) |
 | 9 | Model Swappability | — | absorbed into Task 6 / CP-4 |
-| 10 | Multi-axis Benchmark Lab | (new doc in CP-5) | ⬜ CP-5 |
+| 10 | Multi-axis Benchmark Lab | [docs/task-10-benchmark-lab.md](docs/task-10-benchmark-lab.md) | ✅ closed in CP-5 (4 frameworks × 5 harnesses, `/lab/*` API + dashboard) |
 | 8 | Open Source Release | [docs/task-8-release.md](docs/task-8-release.md) | ⬜ CP-8 |
 
 ## Notes
@@ -230,3 +230,36 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
 - **Live verification**: gateway restarted via `stack.py restart`; `/health`
   shows both models `runtime=omlx running=True`; end-to-end `gateway-moe`
   request 200 through the new path.
+
+## CP-5 completion log (2026-09-06)
+
+- **`benchmark_lab.py`** (new, ~700 lines): multi-axis benchmark lab.
+  - `MODELS` registry separates server-start paths (`mlx_path`,
+    `llamacpp_path`) from request ids (`omlx`, `mlx_id`, `llamacpp_id`,
+    `ollama`) — the model-swap seam for the lab.
+  - `FrameworkManager` (ensure/release/health) for 4 frameworks: `omlx`
+    (admin load/unload, resident), `mlx` (`mlx_lm.server` :8200),
+    `llamacpp` (`llama-server` :8300), `ollama` (created from GGUF, :11434).
+    Load → run → unload keeps the benchmark copy transient.
+  - 5 harness runners: `raw` (streaming HTTP, exact tokens from usage),
+    `pi` (`PI_CODING_AGENT_DIR` isolated), `omp` (built-in `bench`,
+    `PI_CODING_AGENT_DIR` isolated, exact tokens), `sisyphus` (opencode +
+    Sisyphus agent, `OPENCODE_CONFIG` isolated, exact tokens from
+    `step_finish`), `dsh` (DeepSeek Harness headless, `DSH_HOME` isolated
+    with a `cordis.patch.yml` overriding `agent-default-model`).
+  - `run_benchmark()` orchestrator with a `warmup` (default 1) uncounted
+    iteration to absorb server/model warmup. CLI: `options` / `run`.
+- **`proxy.py`**: `import benchmark_lab`; `/lab/options`, `/lab/run`,
+  `/lab/status/{id}`, `/lab/results`, `/lab/clear` endpoints (jobs run in a
+  thread via `asyncio.to_thread`, one at a time); **3-Axis Lab** dashboard
+  tab (model/framework/harness dropdowns, run button, current-job panel,
+  results table).
+- **`.gitignore`**: added `models/` (48 GB GGUFs), `.omo/`, `bench-state/`.
+- **`docs/task-10-benchmark-lab.md`** (new): axes, residency model, metrics,
+  dashboard + CLI usage, one-time setup, model-change procedure.
+- **Smoke-tested every framework × harness** (MoE model): oMLX/MLX/llama.cpp/
+  Ollama × raw; oMLX × pi/omp/sisyphus/dsh; llama.cpp × pi. All cells return
+  `status: success` with sane metrics (e.g. oMLX×raw TTFT ~286 ms / ~113 TPS;
+  llama.cpp×raw TTFT ~90 ms / ~97 TPS; oMLX×omp TTFT ~478 ms / ~83 TPS).
+- **Tests**: 127 passed, 10 deselected; ruff clean. Gateway restarted; `/lab/*`
+  API + dashboard verified live.
