@@ -37,6 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from backends import BackendInterface, build_backend
 from routing_logic import RoutingEngine, strip_routing_controls, text_content
 
 ROUTING_ENGINE = RoutingEngine(os.path.join(os.path.dirname(__file__), "routing_rules.json"))
@@ -73,17 +74,75 @@ MODEL_CONTEXT_WINDOW = int(os.getenv("MODEL_CONTEXT_WINDOW", "128000"))
 
 OMLX_UPSTREAM = os.getenv("OMLX_UPSTREAM", "http://127.0.0.1:8000")
 OMLX_API_KEY = os.getenv("OMLX_API_KEY", "")
-UPSTREAM_HEADERS = {"Authorization": f"Bearer {OMLX_API_KEY}"} if OMLX_API_KEY else {}
-OMLX_ADMIN = os.getenv("OMLX_ADMIN", f"{OMLX_UPSTREAM}/admin")
-MOE_MODEL = os.getenv("MOE_MODEL", str((ROUTE_CONFIG.get("moe") or {}).get("model", "mlx-community--Qwen3.6-35B-A3B-6bit")))
-DENSE_MODEL = os.getenv("DENSE_MODEL", str((ROUTE_CONFIG.get("dense") or {}).get("model", "scottlowry--Qwen3.8-27B-oQ6e-mtp")))
-MODEL_ENDPOINTS = {
-    "moe": os.getenv("MOE_UPSTREAM", OMLX_UPSTREAM),
-    "dense": os.getenv("DENSE_UPSTREAM", OMLX_UPSTREAM),
-}
-MODEL_IDS = {"moe": MOE_MODEL, "dense": DENSE_MODEL}
+
+
+def derive_route_state(config: dict[str, Any]) -> dict[str, Any]:
+    """Derive route state from a parsed router config (pure, testable).
+
+    This is the model-swappability seam: changing models or backends in
+    router.yaml flows through here with no code changes. Env overrides:
+    MOE_MODEL / DENSE_MODEL (model IDs), OMLX_UPSTREAM (default upstream),
+    OMLX_API_KEY (default key), MOE_UPSTREAM / DENSE_UPSTREAM (per-route
+    upstream). Routes with identical backend specs share one instance
+    (one residency domain).
+    """
+    route_config = config.get("routes") or {}
+    backends_cfg = config.get("backends") or {}
+    default_upstream = os.getenv("OMLX_UPSTREAM", "http://127.0.0.1:8000")
+    api_key = os.getenv("OMLX_API_KEY", "")
+
+    model_ids = {
+        route: os.getenv(
+            f"{route.upper()}_MODEL",
+            str((route_config.get(route) or {}).get("model", "")),
+        )
+        for route in ("moe", "dense")
+    }
+
+    shared: dict[tuple, BackendInterface] = {}
+    backends: dict[str, BackendInterface] = {}
+    for route in ("moe", "dense"):
+        spec = dict(backends_cfg.get(route) or {})
+        env_upstream = os.getenv(f"{route.upper()}_UPSTREAM", "")
+        if env_upstream:
+            spec["upstream"] = env_upstream
+        spec.setdefault("upstream", default_upstream)
+        if api_key and not spec.get("api_key"):
+            spec["api_key"] = api_key
+        key = (
+            str(spec.get("type", "omlx")).lower(),
+            str(spec.get("upstream", "")).rstrip("/"),
+            str(spec.get("api_key", "") or ""),
+        )
+        if key not in shared:
+            shared[key] = build_backend(spec)
+        backends[route] = shared[key]
+
+    model_capabilities = {
+        route: {
+            "context_window": int(((route_config.get(route) or {}).get("capabilities") or {}).get("context_window") or 0),
+            "max_output": int(((route_config.get(route) or {}).get("capabilities") or {}).get("max_output") or 0),
+            "vision": bool(((route_config.get(route) or {}).get("capabilities") or {}).get("vision", False)),
+        }
+        for route in ("moe", "dense")
+    }
+    return {
+        "model_ids": model_ids,
+        "model_routes": {value: key for key, value in model_ids.items()},
+        "model_capabilities": model_capabilities,
+        "backends": backends,
+        "endpoints": {route: backend.upstream for route, backend in backends.items()},
+    }
+
+
+_ROUTE_STATE = derive_route_state(ROUTER_CONFIG)
+MOE_MODEL = _ROUTE_STATE["model_ids"]["moe"]
+DENSE_MODEL = _ROUTE_STATE["model_ids"]["dense"]
+MODEL_IDS = _ROUTE_STATE["model_ids"]
+ROUTE_BACKENDS = _ROUTE_STATE["backends"]
+MODEL_ENDPOINTS = _ROUTE_STATE["endpoints"]
 RUNTIME_MODEL_IDS = dict(MODEL_IDS)
-MODEL_ROUTES = {value: key for key, value in MODEL_IDS.items()}
+MODEL_ROUTES = _ROUTE_STATE["model_routes"]
 BENCHMARK_MODEL_ALIASES = {
     "benchmark-moe": "moe",
     "benchmark-dense": "dense",
@@ -119,14 +178,7 @@ if FALLBACK_ROUTE not in ("moe", "dense"):
 
 # Per-route capability metadata (context window, max output, vision). Drives
 # capability-aware routing adjustments and is reported in /metrics.
-MODEL_CAPABILITIES = {
-    route: {
-        "context_window": int((spec.get("capabilities") or {}).get("context_window") or 0),
-        "max_output": int((spec.get("capabilities") or {}).get("max_output") or 0),
-        "vision": bool((spec.get("capabilities") or {}).get("vision", False)),
-    }
-    for route, spec in ROUTE_CONFIG.items()
-}
+MODEL_CAPABILITIES = _ROUTE_STATE["model_capabilities"]
 
 # Start protecting the machine when available memory falls below this.
 # 3 GiB is the user's requested safety zone.
@@ -215,7 +267,9 @@ benchmark_jobs: dict[str, dict[str, Any]] = {}
 benchmark_lock = asyncio.Lock()
 manual_pin_lock = asyncio.Lock()
 last_activity_at = time.time()
-omlx_status_cache: dict[str, Any] = {"updated_at": 0.0, "models": {}}
+backend_status_cache: dict[str, dict[str, Any]] = {
+    route: {"updated_at": 0.0, "models": {}} for route in ("moe", "dense")
+}
 
 BENCHMARK_SUITES = {
     "quick": {
@@ -555,44 +609,43 @@ def process_pid_running(name: str) -> bool:
         return False
 
 
-def omlx_models(force: bool = False) -> dict[str, dict[str, Any]]:
-    """Return oMLX model load state, with a short cache for dashboard polling."""
-    if not force and time.time() - float(omlx_status_cache["updated_at"]) < 0.5:
-        return omlx_status_cache["models"]
+async def backend_models(route: str, force: bool = False) -> dict[str, dict[str, Any]]:
+    """Return the route backend's model load state, cached briefly for polling."""
+    cache = backend_status_cache[route]
+    if not force and time.time() - float(cache["updated_at"]) < 0.5:
+        return cache["models"]
     try:
-        response = httpx.get(f"{OMLX_ADMIN}/api/models", timeout=2.0, headers=UPSTREAM_HEADERS)
-        response.raise_for_status()
-        models = {
-            item["id"]: item for item in response.json().get("models", [])
-            if isinstance(item, dict) and item.get("id")
-        }
-        omlx_status_cache.update({"updated_at": time.time(), "models": models})
+        models = await ROUTE_BACKENDS[route].list_models()
+        cache.update({"updated_at": time.time(), "models": models})
     except Exception:
         # A transient admin/status failure must not erase the last known state.
         pass
-    return omlx_status_cache["models"]
+    return cache["models"]
 
 
-def invalidate_omlx_status() -> None:
-    omlx_status_cache["updated_at"] = 0.0
+def invalidate_backend_status(route: str) -> None:
+    backend_status_cache[route]["updated_at"] = 0.0
 
 
-def pid_running(name: str) -> bool:
-    """Compatibility name retained for routing code; models now live in oMLX."""
+async def pid_running(name: str) -> bool:
+    """Compatibility name retained for routing code; models live in backends."""
     if name in RUNTIME_MODEL_IDS:
-        return bool(omlx_models().get(RUNTIME_MODEL_IDS[name], {}).get("loaded"))
+        states = await backend_models(name)
+        return bool(states.get(RUNTIME_MODEL_IDS[name], {}).get("loaded"))
     return process_pid_running(name)
 
 
-def model_state() -> dict:
-    states = omlx_models()
+async def model_state() -> dict:
+    states: dict[str, dict[str, Any]] = {}
+    for route in ("moe", "dense"):
+        states.update(await backend_models(route))
     return {
         route: {
             "model": RUNTIME_MODEL_IDS[route],
             "endpoint": MODEL_ENDPOINTS[route],
             "running": bool(states.get(RUNTIME_MODEL_IDS[route], {}).get("loaded")),
             "loading": bool(states.get(RUNTIME_MODEL_IDS[route], {}).get("is_loading")),
-            "runtime": "omlx",
+            "runtime": ROUTE_BACKENDS[route].name,
         }
         for route in ("moe", "dense")
     }
@@ -674,17 +727,17 @@ async def wait_for_backend_drain_before_routing(req_id: Optional[str]) -> None:
         await asyncio.sleep(0.1)
 
 
-async def wait_for_model_transition(client, model_id: str, loaded: bool) -> dict:
+async def wait_for_model_transition(backend: BackendInterface, model_id: str, loaded: bool) -> dict:
     """Admin unload may return HTTP 202 while activity drains."""
     deadline = time.monotonic() + SWAP_TIMEOUT_SEC
     while True:
-        response = await client.get(f"{OMLX_ADMIN}/api/models")
-        response.raise_for_status()
-        states = {item["id"]: item for item in response.json()["models"]}
-        omlx_status_cache.update({"updated_at": time.time(), "models": states})
+        states = await backend.list_models()
+        for r, b in ROUTE_BACKENDS.items():
+            if b is backend:
+                backend_status_cache[r].update({"updated_at": time.time(), "models": states})
         entry = states.get(model_id)
         if entry is None:
-            raise RuntimeError(f"oMLX model disappeared during transition: {model_id}")
+            raise RuntimeError(f"backend model disappeared during transition: {model_id}")
         if bool(entry.get("loaded")) == loaded and not entry.get("is_loading"):
             return states
         if time.monotonic() >= deadline:
@@ -696,40 +749,44 @@ async def wait_for_model_transition(client, model_id: str, loaded: bool) -> dict
 
 
 async def ensure_route(route: str) -> float:
-    """Ensure the requested backend is loaded; retain both by default.
+    """Ensure the requested route's model is loaded on its backend.
 
-    Query fresh state and fail closed on admin errors. Never use the old
-    stack script, whose ports and model IDs may describe a different machine.
+    Query fresh state and fail closed on admin errors. When both routes share
+    one backend instance and KEEP_MODELS_LOADED is false, the other model is
+    unloaded first to release memory. Backends without a residency API
+    (generic OpenAI servers) are assumed to keep their model loaded.
     """
     if route not in MODEL_IDS:
         raise ValueError(f"Unknown route: {route}")
+    backend = ROUTE_BACKENDS[route]
+    other_route = "dense" if route == "moe" else "moe"
+    shared = ROUTE_BACKENDS[other_route] is backend
     started = now_ms()
     changed = False
     async with swap_lock:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(SWAP_TIMEOUT_SEC), headers=UPSTREAM_HEADERS
-        ) as client:
-            response = await client.get(f"{OMLX_ADMIN}/api/models")
-            response.raise_for_status()
-            states = {item["id"]: item for item in response.json()["models"]}
-            target = MODEL_IDS[route]
-            if target not in states:
-                raise RuntimeError(f"oMLX has not discovered model {target}")
-            other = MODEL_IDS["dense" if route == "moe" else "moe"]
-            if any(states.get(mid, {}).get("is_loading") for mid in (target, other)):
-                raise RuntimeError("A backend is already loading; retry after it finishes")
-            if not KEEP_MODELS_LOADED and states.get(other, {}).get("loaded"):
-                response = await client.post(f"{OMLX_ADMIN}/api/models/{other}/unload")
-                response.raise_for_status()
+        states = await backend.list_models()
+        target = MODEL_IDS[route]
+        if target not in states:
+            raise RuntimeError(f"backend {backend.name} has not discovered model {target}")
+        if any(state.get("is_loading") for state in states.values()):
+            raise RuntimeError("A backend is already loading; retry after it finishes")
+        if shared and not KEEP_MODELS_LOADED:
+            other = MODEL_IDS[other_route]
+            if states.get(other, {}).get("loaded"):
+                await backend.unload_model(other)
                 changed = True
-                states = await wait_for_model_transition(client, other, loaded=False)
-            if not states[target].get("loaded"):
-                response = await client.post(f"{OMLX_ADMIN}/api/models/{target}/load")
-                response.raise_for_status()
-                changed = True
-            states = await wait_for_model_transition(client, target, loaded=True)
-            if not KEEP_MODELS_LOADED and states.get(other, {}).get("loaded"):
-                raise RuntimeError(f"Other backend became loaded during transition: {other}")
+                states = await wait_for_model_transition(backend, other, loaded=False)
+        if not states[target].get("loaded"):
+            if not backend.supports_residency:
+                raise RuntimeError(
+                    f"backend {backend.name} does not list model {target} and has no "
+                    "admin load API; start the server with that model"
+                )
+            await backend.load_model(target)
+            changed = True
+        states = await wait_for_model_transition(backend, target, loaded=True)
+        if shared and not KEEP_MODELS_LOADED and states.get(MODEL_IDS[other_route], {}).get("loaded"):
+            raise RuntimeError(f"Other backend became loaded during transition: {MODEL_IDS[other_route]}")
     return now_ms() - started if changed else 0.0
 
 
@@ -818,7 +875,7 @@ async def wait_for_memory(req_id: str, planned_route: str = ""):
 
         # Either transition first unloads the other large backend, releasing memory.
         # Do not deadlock by waiting for that memory before allowing the swap.
-        if not KEEP_MODELS_LOADED and planned_route in MODEL_IDS and pid_running("dense" if planned_route == "moe" else "moe"):
+        if not KEEP_MODELS_LOADED and planned_route in MODEL_IDS and await pid_running("dense" if planned_route == "moe" else "moe"):
             return now_ms() - waited_start
 
         async with lock:
@@ -870,9 +927,11 @@ async def startup():
     if KEEP_MODELS_LOADED:
         for route in MODEL_IDS:
             await ensure_route(route)
-        states = omlx_models(force=True)
+        states: dict[str, dict[str, Any]] = {}
+        for route in MODEL_IDS:
+            states.update(await backend_models(route, force=True))
         if not all(states.get(mid, {}).get("loaded") for mid in MODEL_IDS.values()):
-            raise RuntimeError("oMLX could not retain both models; check its memory limits")
+            raise RuntimeError("backends could not retain both models; check their memory limits")
     asyncio.create_task(memory_watcher())
 
 
@@ -887,7 +946,7 @@ async def health():
         "ok": True,
         "gateway": "phase2",
         "ttft_definition": "upstream dispatch to first generated content/reasoning token",
-        "models": model_state(),
+        "models": await model_state(),
         "active_requests": len(active),
         "max_active_requests": MAX_ACTIVE_REQUESTS,
         "keep_models_loaded": KEEP_MODELS_LOADED,
@@ -905,7 +964,7 @@ async def metrics():
             "memory": memory_state,
             "active": list(active.values()),
             "history": list(history),
-            "models": model_state(),
+            "models": await model_state(),
             "cache": {**cache_stats, "entries": len(response_cache), "ttl_sec": CACHE_TTL_SEC},
             "route_affinity": {
                 "task_routes": 0,
@@ -958,7 +1017,7 @@ async def control_model(route: str):
             elapsed = await ensure_route(route)
         return {
             "ok": True, "route": route, "swap_ms": round(elapsed, 1),
-            "models": model_state(), "manual_pin": manual_pin_status(),
+            "models": await model_state(), "manual_pin": manual_pin_status(),
         }
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
@@ -1258,9 +1317,9 @@ async def benchmark_infer(route: str, body: dict) -> tuple[int, float, Optional[
     body = dict(body)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
-    async with httpx.AsyncClient(timeout=None, headers=UPSTREAM_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=None, headers=ROUTE_BACKENDS[route].headers()) as client:
         async with client.stream(
-            "POST", f"{MODEL_ENDPOINTS[route]}/v1/chat/completions", json=body
+            "POST", ROUTE_BACKENDS[route].chat_url(), json=body
         ) as response:
             if response.status_code >= 400:
                 detail = (await response.aread()).decode("utf-8", errors="replace")
@@ -1576,7 +1635,7 @@ async def run_pi_benchmark(route: str, suite_id: str, prompt: str, workspace: st
 async def run_benchmark(job_id: str, suite_id: str, routes: list[str], max_tokens: int,
                         benchmark_prompt: str):
     job = benchmark_jobs[job_id]
-    original_route = "dense" if pid_running("dense") else "moe"
+    original_route = "dense" if await pid_running("dense") else "moe"
     suite = BENCHMARK_SUITES[suite_id]
     try:
         async with benchmark_lock:
@@ -1741,7 +1800,7 @@ async def start_benchmark(request: Request):
 
 @app.get("/v1/models")
 async def models():
-    state = model_state()
+    state = await model_state()
     return {
         "object": "list",
         "data": [
@@ -1927,9 +1986,9 @@ async def proxy_nonstream(
             async with lock:
                 if req_id in active:
                     active[req_id].update({"model": MODEL_IDS[route], "route": route, "route_reason": route_reason, "swap_ms": swap_ms})
-            async with httpx.AsyncClient(timeout=None, headers=UPSTREAM_HEADERS) as client:
+            async with httpx.AsyncClient(timeout=None, headers=ROUTE_BACKENDS[route].headers()) as client:
                 r = await client.post(
-                    f"{MODEL_ENDPOINTS[route]}/v1/chat/completions",
+                    ROUTE_BACKENDS[route].chat_url(),
                     json=routed_body,
                 )
 
@@ -2105,10 +2164,10 @@ async def stream_upstream(body: dict, req_id: str, route: str):
     low_memory_events = 0
     timeout = httpx.Timeout(None)
 
-    async with httpx.AsyncClient(timeout=timeout, headers=UPSTREAM_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=ROUTE_BACKENDS[route].headers()) as client:
         async with client.stream(
             "POST",
-            f"{MODEL_ENDPOINTS[route]}/v1/chat/completions",
+            ROUTE_BACKENDS[route].chat_url(),
             json=body,
         ) as response:
 

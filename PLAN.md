@@ -74,7 +74,7 @@ CI green. No task starts until the previous checkpoint is closed.
 | **CP-1** ✅ | **Task 1: CI/CD re-run** | `ci.yml` covers `routing_logic.py`, `routing_rules.json` (validation test), `scripts/stack.py`; ruff clean; unit tests in CI; pre-commit verified | Baseline `d762373` pushed | **Closed**: ruff fixes + Python 3.12/3.13/3.14 matrix; CI green on `c500024` |
 | **CP-2** ✅ | **Task 3 rework: routing fixes + rationale** | R1–R8 above; deterministic decision fields (level, matched rules, source, rules_version) in `Metric` + dashboard + `/api/routing-rationale` export | CP-1 closed | **Closed**: rules v2, 12-prompt regression suite, dead code removed, CI green (see CP-2 log below) |
 | **CP-3** ✅ | **Task 2: integration re-baseline** | Live stack (oMLX running with both models), 10 integration tests, `benchmark_real.py`, M5 Max 128 GB baselines with Qwen3.6-6bit + Qwen3.8-oQ6e | CP-2 closed (fixed routing before generating data) | **Closed**: gateway cutover to project folder, 10/10 integration tests, M5 Max baselines committed (see CP-3 log below) |
-| **CP-4** | **Task 6 + Task 9: backend abstraction + model swappability** | `BackendInterface` ABC; `OMLXBackend` (OpenAI-compatible chat + admin residency); `OpenAIBackend` (generic — covers MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio); `backends:` config in `router.yaml`; documented model-change procedure + tests (config change, no code change → routes to new model) | CP-3 closed (live stack for validation) | Behavior unchanged via interface; model swap tested; CI green |
+| **CP-4** ✅ | **Task 6 + Task 9: backend abstraction + model swappability** | `BackendInterface` ABC; `OMLXBackend` (OpenAI-compatible chat + admin residency); `OpenAIBackend` (generic — covers MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio); `backends:` config in `router.yaml`; documented model-change procedure + tests (config change, no code change → routes to new model) | CP-3 closed (live stack for validation) | **Closed**: `backends.py` + `derive_route_state()` seam, 127 tests, live restart verified (see CP-4 log below) |
 | **CP-5** | **Task 10 (new): multi-axis benchmark lab** | Model dropdown (all backend models, **load-run-unload** residency to preserve RAM); framework dropdown (backends from config); harness dropdown (installed detection) + adapters; 3-axis results (model × framework × harness) with backend/harness columns | CP-4 closed | Any model × framework × installed harness runnable; RAM preserved; CI green |
 | **CP-6** | **Task 5: cache enhancement** | Semantic dedup + warming + `/api/cache/analytics` + dashboard | CP-5 closed | Tests pass, CI green |
 | **CP-7** | **Task 7: refinement loop** | Refine `routing_rules.json` (terms/levels) from benchmark verdicts via `update_rules()` / `PUT /routing/rules`; analyzer + generator + endpoints | CP-6 closed (needs CP-2 decision data + CP-5 verdicts) | Loop demonstrated end-to-end, CI green |
@@ -139,7 +139,7 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
 | 3 | Routing Rationale | [docs/task-3-rationale.md](docs/task-3-rationale.md) | ✅ closed in CP-2 (rules v2, R1–R8, rationale capture) |
 | 4 | Benchmark Suites | [docs/task-4-benchmarks.md](docs/task-4-benchmarks.md) | ✅ core done (5 artifact suites); live runs in CP-3/CP-5 |
 | 5 | Cache Enhancement | [docs/task-5-cache.md](docs/task-5-cache.md) | ⬜ CP-6 |
-| 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | 🔄 CP-4 (absorbs Task 9) |
+| 6 | Backend Abstraction | [docs/task-6-backend.md](docs/task-6-backend.md) | ✅ implemented in CP-4 (absorbs Task 9) |
 | 7 | Instruction Refinement | [docs/task-7-refinement.md](docs/task-7-refinement.md) | 🔄 reworked in CP-7 (refine rules, not judge prompt) |
 | 9 | Model Swappability | — | absorbed into Task 6 / CP-4 |
 | 10 | Multi-axis Benchmark Lab | (new doc in CP-5) | ⬜ CP-5 |
@@ -200,3 +200,33 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
   output now written as clean JSON (the old file was contaminated with stdout prints).
   New M5 Max baselines in `tests/benchmark_results.json` (MoE ~2.5x faster than dense on
   medium/complex 100-token completions).
+
+## CP-4 completion log (2026-09-06)
+
+- **`backends.py`** (new): `BackendInterface` ABC (`chat_url`, `headers`,
+  `list_models`, `load_model`, `unload_model`, `health_check`,
+  `supports_residency`); `OMLXBackend` (OpenAI-compatible chat +
+  `/admin/api/models` residency); `OpenAIBackend` (generic OpenAI-compatible
+  servers — MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio;
+  listed models treated as loaded, residency raises `NotImplementedError`);
+  `build_backend()` factory with validation.
+- **`proxy.py`**: oMLX-specific logic replaced with per-route backends.
+  New pure seam `derive_route_state(config)` derives model IDs, routes,
+  capabilities, backends, and endpoints from the parsed router config (env
+  overrides preserved: `MOE_MODEL`/`DENSE_MODEL`, `OMLX_UPSTREAM`,
+  `OMLX_API_KEY`, `MOE_UPSTREAM`/`DENSE_UPSTREAM`). Routes with identical
+  backend specs share one instance (one residency domain). `omlx_models()` →
+  async `backend_models(route)`; `model_state()`/`pid_running()` now async;
+  `ensure_route()`/`wait_for_model_transition()` backend-aware (cross-route
+  unload only when both routes share a backend; non-resident backends fail
+  closed with a clear message). All three forwarding sites use
+  `ROUTE_BACKENDS[route].chat_url()` + `.headers()`.
+- **`router.yaml`** v3: `backends:` section (both routes `omlx` @ :8000).
+- **Tests**: 14 new in `tests/test_backends.py` (factory, both adapters
+  against fake servers, model swap via config through `derive_route_state`
+  — no module reload, per-route backend types, env overrides). 127 passed,
+  10 deselected; ruff clean. `test_current_setup.py` residency tests pass
+  unchanged through the abstraction.
+- **Live verification**: gateway restarted via `stack.py restart`; `/health`
+  shows both models `runtime=omlx running=True`; end-to-end `gateway-moe`
+  request 200 through the new path.

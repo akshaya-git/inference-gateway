@@ -1,6 +1,85 @@
 # Task 6: Generic Backend Abstraction
 
-## Overview
+## Status: ✅ IMPLEMENTED (CP-4, 2026-09-06)
+
+The gateway talks to model servers through `BackendInterface` (`backends.py`).
+Two adapters ship today:
+
+| Adapter | Frameworks | Residency (load/unload) |
+|---------|-----------|------------------------|
+| `OMLXBackend` | oMLX | ✅ `/admin/api/models` query/load/unload |
+| `OpenAIBackend` | MLX `mlx_lm.server`, llama.cpp `llama-server`, Ollama, LM Studio — any OpenAI-compatible server | ❌ models fixed at server start |
+
+### Interface (`backends.py`)
+
+```python
+class BackendInterface(abc.ABC):
+    name: str                      # "omlx" | "openai"
+    upstream: str                  # base URL, e.g. http://127.0.0.1:8000
+
+    def chat_url(self) -> str      # full /v1/chat/completions URL
+    def headers(self) -> dict      # auth headers
+    async def list_models(self) -> dict   # {model_id: {loaded, is_loading}}
+    async def load_model(self, model_id)  # NotImplementedError if unsupported
+    async def unload_model(self, model_id)
+    async def health_check(self) -> bool
+    @property
+    def supports_residency(self) -> bool
+```
+
+### Configuration (`router.yaml`)
+
+```yaml
+backends:
+  moe:
+    type: omlx            # omlx | openai
+    upstream: http://127.0.0.1:8000
+  dense:
+    type: omlx
+    upstream: http://127.0.0.1:8000
+```
+
+Env overrides: `OMLX_UPSTREAM` (default upstream), `OMLX_API_KEY` (default
+key), `MOE_UPSTREAM` / `DENSE_UPSTREAM` (per-route upstream), `MOE_MODEL` /
+`DENSE_MODEL` (model IDs). Routes with identical backend specs share one
+backend instance (one residency domain).
+
+### Model-change procedure (no code changes)
+
+1. **Swap a model on an existing backend** (e.g. new MoE workhorse in oMLX):
+   - Add the model to oMLX (oMLX UI or its API).
+   - Edit `router.yaml`: `routes.moe.model: <new-model-id>` (and
+     `capabilities` if they differ).
+   - Restart the gateway: `scripts/stack.py restart`.
+   - Verify: `curl -s localhost:9000/health` shows the new model ID; send a
+     test request through `gateway-moe`.
+2. **Point a route at a different framework** (e.g. dense via llama.cpp):
+   - Start the framework server with the model (e.g.
+     `llama-server -m model.gguf --port 8100`).
+   - Edit `router.yaml`: `backends.dense: {type: openai, upstream: http://127.0.0.1:8100}`
+     and `routes.dense.model: <model-id-as-served>`.
+   - Restart the gateway. Note: generic OpenAI backends have no runtime
+     residency — the model must be loaded when the server starts, and
+     `KEEP_MODELS_LOADED=false` swap-out does not apply to that route.
+3. **Add a new framework with an admin API** (e.g. Ollama load/unload):
+   - Add a backend class in `backends.py` (subclass `BackendInterface`,
+     implement `list_models`/`load_model`/`unload_model`, set
+     `supports_residency`), register it in `BACKEND_TYPES`.
+   - Reference its `type` in `router.yaml`.
+
+### Tests
+
+- `tests/test_backends.py`: factory validation, OMLXBackend against a fake
+  oMLX server (list/load/unload/health), OpenAIBackend (listed = loaded,
+  residency raises), model swap via config (pure `derive_route_state`, no
+  module reload), per-route backend types, env overrides.
+- `tests/test_current_setup.py`: residency transitions (single-backend
+  swap, queued unload, timeout, resident mode) — unchanged, still green
+  through the new abstraction.
+
+---
+
+## Original design (superseded by the implementation above)
 
 Make the gateway work with any model-hosting framework (oMLX, MLX, LLaMA, vLLM, TGI) by abstracting the backend-specific logic. This makes the gateway portable and future-proof.
 

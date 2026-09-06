@@ -1,4 +1,18 @@
-version: 2
+version: 3
+
+# Per-route model-hosting backends. `type` selects the adapter:
+#   omlx   - oMLX (OpenAI-compatible chat + /admin residency API)
+#   openai - any generic OpenAI-compatible server (MLX mlx_lm.server,
+#            llama.cpp llama-server, Ollama, LM Studio); no runtime residency
+# Env overrides: OMLX_UPSTREAM (default upstream), OMLX_API_KEY, and
+# MOE_UPSTREAM / DENSE_UPSTREAM (per-route upstream).
+backends:
+  moe:
+    type: omlx
+    upstream: http://127.0.0.1:8000
+  dense:
+    type: omlx
+    upstream: http://127.0.0.1:8000
 
 routes:
   moe:
