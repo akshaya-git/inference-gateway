@@ -274,7 +274,8 @@ The lab was narrowed to the MTP comparison the owner actually wants:
 - **Model: 1** — `qwen3.8-27b` (Qwen3.8 27B, 6-bit, MTP) across all 3
   frameworks. The MoE model (`qwen3.6-35b-a3b`) is dropped from the lab.
 - **Harnesses: 3** — `pi`, `omp`, `opencode` (renamed from `sisyphus`).
-  Dropped: `raw`, `bionic`, `dsh`.
+  Dropped: `raw`, `bionic`, `dsh`. (`raw` was brought back the same day for
+  raw throughput validation — see below.)
 - **Budget: 240K context / 32K max tokens / MTP enabled** on every framework:
   llama.cpp `--ctx-size 245760 --n-predict 32768 --spec-type draft-mtp`;
   MTPLX `--context-window 245760 --max-tokens 32768`; oMLX settings applied
@@ -296,3 +297,23 @@ The lab was narrowed to the MTP comparison the owner actually wants:
   (189 tok, 1 iter), mtplx×omp (28.7 TPS), llamacpp×omp (15.2 TPS). All
   transient servers released after their cells; oMLX routing model stayed
   resident. 137 tests pass.
+
+### Lab addendum 2 (same day): verbose output, file viewing, raw restored
+
+- **`raw` harness restored** (streaming HTTP baseline) — owner wants to
+  validate MTPLX's raw decode throughput (its own chat UI shows 51+ t/s).
+  Captures the full response text in the transcript.
+- **Verbose transcript** for every harness: prompt → every iteration/loop →
+  tool calls (with args) → assistant messages → final response. Streamed
+  live to a new **Live lab output** scrolling box (like the Benchmark Lab
+  tab's live Pi view) and stored in the result (`transcript`), viewable via
+  an **Output** button (full block in a modal).
+- **Generated-file tracking**: files the agent creates in its work dir are
+  listed in the result (`files`); a **Files** button + `GET /lab/file`
+  endpoint view them (HTML renders in a new tab; path-traversal safe).
+  opencode is pinned to its work dir with `--dir` (its git-root workspace
+  detection was leaking files into the project root).
+- **omp clarification**: `omp bench` is a request-level benchmark — no tools,
+  no file writes. It never created (or deleted) the HTML file the owner
+  expected; the model's response text is measured and discarded. pi/opencode
+  are the agent harnesses that produce files.

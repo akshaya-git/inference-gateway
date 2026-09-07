@@ -7,9 +7,16 @@ Frameworks (serving backends, all OpenAI-compatible, all MTP-enabled):
   - llamacpp: llama-server with --spec-type draft-mtp; model fixed at start
 
 Harnesses (agent wrappers around the model):
+  - raw:      direct streaming HTTP to /v1/chat/completions (baseline)
   - pi:       pi CLI, full agent (tools enabled), --mode json event stream
-  - omp:      omp CLI (pi fork; built-in `bench` workload)
+  - omp:      omp CLI (pi fork; built-in `bench` workload — request-level,
+              no tools, no file writes)
   - opencode: opencode + oh-my-opencode plugin (Sisyphus agent)
+
+Every harness emits a verbose transcript (prompt, every iteration/loop, tool
+calls, assistant messages, final response) via a log callback so the
+dashboard can show a live scrolling view and the full output block after the
+run. Files the agent generates in its work dir are listed in the result.
 
 Residency model (load-run-unload): only the model under test is loaded in a
 non-resident framework, on top of the always-resident oMLX routing models.
@@ -73,10 +80,11 @@ FRAMEWORKS: dict[str, dict[str, Any]] = {
 }
 
 HARNESSES: dict[str, dict[str, Any]] = {
+    "raw": {"label": "raw (streaming HTTP)", "available": True},
     "pi": {"label": "pi", "available": shutil.which("pi") is not None},
-    "omp": {"label": "omp", "available": shutil.which("omp") is not None},
+    "omp": {"label": "omp (bench)", "available": shutil.which("omp") is not None},
     "opencode": {"label": "opencode (Sisyphus)", "available": shutil.which("opencode") is not None},
-    # Dropped: raw (baseline), bionic (LM Studio GUI), dsh (deepseek harness).
+    # Dropped: bionic (LM Studio GUI), dsh (deepseek harness).
 }
 
 # Standard benchmark prompt (unique suffix added per iteration to avoid cache).
@@ -88,6 +96,35 @@ BENCH_PROMPT = (
 
 def _noop(stage: str) -> None:
     """Default no-op progress callback."""
+
+
+class LabLog:
+    """Collects a verbose transcript of a benchmark cell.
+
+    Every line is timestamped and stored in ``lines`` (returned in the result
+    as ``transcript``). Each entry is also pushed to ``log_cb(kind, message)``
+    so a caller (the dashboard) can render a live scrolling view.
+    """
+
+    MAX_MESSAGE = 8000   # per-line cap (full assistant messages / tool args)
+    MAX_LINES = 3000     # total cap (bounds memory on very long runs)
+
+    def __init__(self, log_cb=None) -> None:
+        self.lines: list[str] = []
+        self._cb = log_cb
+
+    def emit(self, kind: str, message: str) -> None:
+        message = str(message).replace("\r", " ")
+        if len(message) > self.MAX_MESSAGE:
+            message = message[: self.MAX_MESSAGE] + f" …[+{len(message) - self.MAX_MESSAGE} chars]"
+        stamp = time.strftime("%H:%M:%S")
+        self.lines.append(f"[{stamp}] {kind}: {message}")
+        del self.lines[: -self.MAX_LINES]
+        if self._cb:
+            try:
+                self._cb(kind, message)
+            except Exception:  # noqa: BLE001 - logging must never break a run
+                pass
 
 
 def _artifact(framework: str, model_key: str) -> dict[str, Any] | None:
@@ -314,11 +351,14 @@ class BenchResult:
     agent_iters: list[int] = field(default_factory=list)  # agent turns/steps per iteration
     error: str = ""
     work_dir: str = ""
+    transcript: list[str] = field(default_factory=list)  # verbose log lines
+    files: list[dict] = field(default_factory=list)      # files generated in the work dir
 
     def summary(self) -> dict[str, Any]:
         if not self.ok:
             return {"status": "failed", "error": self.error or "no successful runs",
-                    "ok": 0, "failed": self.failed, "work_dir": self.work_dir}
+                    "ok": 0, "failed": self.failed, "work_dir": self.work_dir,
+                    "transcript": self.transcript, "files": self.files}
         total = statistics.mean(self.total_ms)
         toks = statistics.mean(self.tokens)
         if self.ttft_ms:
@@ -343,7 +383,115 @@ class BenchResult:
             "avg_tps": round(tps, 2),
             "avg_agent_iters": round(agent_iters, 2) if agent_iters is not None else None,
             "work_dir": self.work_dir,
+            "transcript": self.transcript,
+            "files": self.files,
         }
+
+
+def _workdir_files(work_dir: Path) -> list[dict]:
+    """List files generated in the work dir (excluding harness config dirs)."""
+    files: list[dict] = []
+    if not work_dir.exists():
+        return files
+    skip_dirs = {"sessions", ".git", "node_modules", ".omlx", ".omc"}
+    for root, dirs, names in os.walk(work_dir):
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".")
+                   and d not in skip_dirs and not d.endswith("-config")]
+        for name in sorted(names):
+            if name.startswith("."):
+                continue
+            p = Path(root) / name
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            files.append({"name": str(p.relative_to(work_dir)), "size": size})
+    return files
+
+
+def _run_raw(endpoint: str, model_id: str, prompt: str, iterations: int,
+             max_tokens: int, config_dir: Path, progress_cb=None,
+             log: LabLog | None = None) -> BenchResult:
+    """Direct streaming HTTP to /v1/chat/completions (baseline harness).
+
+    One streaming call per iteration with ``stream_options.include_usage``.
+    TTFT and total time are measured locally (portable); the token count comes
+    from the standard ``usage.completion_tokens`` in the final chunk. The full
+    response text is captured in the transcript. No timeout: long-running
+    tasks run to completion.
+    """
+    cb = progress_cb or _noop
+    log = log or LabLog()
+    res = BenchResult(harness="raw", framework="", model=model_id, iterations=iterations)
+    url = f"{endpoint}/v1/chat/completions"
+    with httpx.Client(timeout=None) as client:
+        for i in range(iterations):
+            cb(f"raw iteration {i + 1}/{iterations}")
+            unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
+            body = {"model": model_id,
+                    "messages": [{"role": "user", "content": unique}],
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                    "stream_options": {"include_usage": True}}
+            log.emit("prompt", f"raw iteration {i + 1}/{iterations}: POST {url} "
+                               f"(model={model_id}, max_tokens={max_tokens})")
+            log.emit("prompt", f"Prompt: {unique}")
+            t0 = time.time()
+            ttft = None
+            tokens = 0
+            text_parts: list[str] = []
+            try:
+                with client.stream("POST", url, json=body) as r:
+                    if r.status_code != 200:
+                        res.failed += 1
+                        res.error = f"HTTP {r.status_code}: {r.read()[:200]}"
+                        log.emit("error", res.error)
+                        continue
+                    for line in r.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        usage = chunk.get("usage")
+                        if usage and usage.get("completion_tokens"):
+                            tokens = int(usage["completion_tokens"])
+                        delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+                        content = delta.get("content") or delta.get("reasoning_content") \
+                            or delta.get("reasoning")
+                        if content:
+                            if ttft is None:
+                                ttft = time.time() - t0
+                                log.emit("stream", f"first token after {ttft * 1000:.0f} ms")
+                            text_parts.append(content)
+                total = time.time() - t0
+                if ttft is None:
+                    res.failed += 1
+                    res.error = "no tokens received"
+                    log.emit("error", res.error)
+                    continue
+                if tokens <= 0:
+                    tokens = max(int(total * 20), 1)  # fallback estimate
+                res.ok += 1
+                res.ttft_ms.append(ttft * 1000)
+                res.total_ms.append(total * 1000)
+                res.tokens.append(tokens)
+                res.agent_iters.append(1)  # one request per raw iteration
+                tps = tokens / max(total - ttft, 0.001)
+                log.emit("result", f"done: {tokens} tokens in {total:.1f}s "
+                                   f"(TTFT {ttft * 1000:.0f} ms, {tps:.1f} t/s decode)")
+                log.emit("response", "".join(text_parts))
+            except httpx.HTTPError as e:
+                res.failed += 1
+                res.error = str(e)
+                log.emit("error", str(e))
+    res.transcript = log.lines
+    return res
 
 
 def _write_pi_config(config_dir: Path, endpoint: str, model_id: str) -> None:
@@ -370,15 +518,18 @@ def _write_pi_config(config_dir: Path, endpoint: str, model_id: str) -> None:
 
 
 def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
-            max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
+            max_tokens: int, config_dir: Path, progress_cb=None,
+            log: LabLog | None = None) -> BenchResult:
     """Run the pi CLI as a full agent (tools enabled) in an isolated work dir.
 
     Uses ``--mode json`` and streams the event stream live to capture exact
     metrics: agent iterations (``turn_end`` events), output tokens (per
-    assistant ``message_end`` usage), and TTFT (first streamed delta).
-    No timeout: long-running tasks run to completion.
+    assistant ``message_end`` usage), and TTFT (first streamed delta). Every
+    event (turns, tool calls, assistant messages) is written to the verbose
+    transcript. No timeout: long-running tasks run to completion.
     """
     cb = progress_cb or _noop
+    log = log or LabLog()
     res = BenchResult(harness="pi", framework="", model=model_id, iterations=iterations)
     config_dir.mkdir(parents=True, exist_ok=True)
     work_dir = config_dir.parent / "pi-work"
@@ -394,6 +545,9 @@ def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
     for i in range(iterations):
         cb(f"pi iteration {i + 1}/{iterations} (agent working in {work_dir.name})")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
+        log.emit("prompt", f"pi iteration {i + 1}/{iterations}: agent started "
+                           f"(tools enabled, work dir {work_dir.name})")
+        log.emit("prompt", f"Prompt: {unique}")
         t0 = time.time()
         turns = 0
         out_tokens = 0
@@ -415,16 +569,33 @@ def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
                 except json.JSONDecodeError:
                     continue
                 etype = ev.get("type")
-                if etype == "turn_end":
+                if etype == "turn_start":
+                    log.emit("turn", f"turn {turns + 1} started")
+                elif etype == "turn_end":
                     turns += 1
+                    log.emit("turn", f"turn {turns} ended")
+                elif etype == "tool_execution_start":
+                    args = json.dumps(ev.get("args") or {}, ensure_ascii=False)
+                    log.emit("tool", f"running {ev.get('toolName', 'tool')}: {args}")
+                elif etype == "tool_execution_end":
+                    state = "FAILED" if ev.get("isError") else "completed"
+                    log.emit("tool", f"{ev.get('toolName', 'tool')} {state}")
                 elif etype == "message_end":
                     msg = ev.get("message") or {}
                     if msg.get("role") == "assistant":
                         out_tokens += int((msg.get("usage") or {}).get("output") or 0)
+                        text = "".join(
+                            c.get("text", "") for c in (msg.get("content") or [])
+                            if isinstance(c, dict) and c.get("type") == "text")
+                        if text.strip():
+                            log.emit("assistant", text)
                 elif etype == "message_update" and ttft is None:
                     ame = ev.get("assistantMessageEvent") or {}
                     if ame.get("delta"):
                         ttft = time.time() - t0
+                        log.emit("stream", f"first token after {ttft * 1000:.0f} ms")
+                elif etype in ("agent_end", "agent_settled"):
+                    log.emit("agent", "agent finished")
             proc.wait()
             total = time.time() - t0
             stderr = proc.stderr.read() if proc.stderr else ""
@@ -435,23 +606,34 @@ def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
                 res.agent_iters.append(turns)
                 if ttft is not None:
                     res.ttft_ms.append(ttft * 1000)
+                log.emit("result", f"done: {turns} turns, {out_tokens} output tokens, "
+                                   f"{total:.1f}s total")
             else:
                 res.failed += 1
                 res.error = (stderr or f"rc={proc.returncode}")[-300:]
+                log.emit("error", res.error)
         except Exception as e:  # noqa: BLE001
             res.failed += 1
             res.error = str(e)[-300:]
+            log.emit("error", str(e))
+    res.transcript = log.lines
     return res
 
 
 def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
-             max_tokens: int, profile_dir: Path, progress_cb=None) -> BenchResult:
+             max_tokens: int, profile_dir: Path, progress_cb=None,
+             log: LabLog | None = None) -> BenchResult:
     """Use omp's built-in `bench` against an isolated bench provider.
 
     Each bench run is a single request, so agent iterations = 1 per run.
-    No timeout: long-running tasks run to completion.
+    NOTE: `omp bench` is a request-level throughput benchmark — it has no
+    tools and no file-system access, so it never creates files (the model's
+    response text is measured and discarded). Use pi or opencode for
+    agent tasks that produce files. No timeout: long-running tasks run to
+    completion.
     """
     cb = progress_cb or _noop
+    log = log or LabLog()
     res = BenchResult(harness="omp", framework="", model=model_id, iterations=iterations)
     profile_dir.mkdir(parents=True, exist_ok=True)
     cfg = {
@@ -474,6 +656,11 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
     env["PI_OFFLINE"] = "1"
     env["PI_SKIP_VERSION_CHECK"] = "1"
     cb(f"omp bench ({iterations} runs)")
+    log.emit("prompt", f"omp bench: {iterations} runs, profile=chat, "
+                       f"max_tokens={max_tokens}, model={model_id}")
+    log.emit("prompt", f"Prompt: {prompt}")
+    log.emit("note", "omp bench is a request-level benchmark (no tools, no file "
+                     "writes) — the model's response is measured and discarded")
     try:
         proc = subprocess.run(
             ["omp", "bench", f"bench/{model_id}", "--runs", str(iterations),
@@ -484,11 +671,15 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
         start = out.find("{")
         if start < 0:
             res.error = (proc.stderr or out or "no JSON output")[-300:]
+            log.emit("error", res.error)
+            res.transcript = log.lines
             return res
         data = json.loads(out[start:])
         models = data.get("models") or []
         if not models:
             res.error = "no model results in omp bench output"
+            log.emit("error", res.error)
+            res.transcript = log.lines
             return res
         m = models[0]
         results = m.get("results") or []
@@ -501,6 +692,15 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
         ok_runs = [r for r in results if r.get("ok")]
         res.ok = len(ok_runs)
         res.failed = len(results) - len(ok_runs)
+        for idx, r in enumerate(results, 1):
+            if r.get("ok"):
+                tps = (int(r.get("outputTokens") or 0) /
+                       max(float(r.get("durationMs") or 0) - float(r.get("ttftMs") or 0), 1.0) * 1000.0)
+                log.emit("run", f"run {idx}: ok — TTFT {r.get('ttftMs')} ms, "
+                                f"{r.get('outputTokens')} tokens, {r.get('durationMs')} ms total, "
+                                f"{tps:.1f} t/s decode")
+            else:
+                log.emit("run", f"run {idx}: FAILED — {str(r.get('error') or r)[:200]}")
         if ok_runs:
             res.ttft_ms = [float(r.get("ttftMs") or 0) for r in ok_runs]
             res.total_ms = [float(r.get("durationMs") or 0) for r in ok_runs]
@@ -508,13 +708,21 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
             res.agent_iters = [1] * len(ok_runs)  # one request per bench run
         if res.ok == 0:
             res.error = (m.get("error") or "all runs failed")[-300:]
+            log.emit("error", res.error)
+        else:
+            log.emit("result", f"done: {res.ok}/{len(results)} runs ok, "
+                               f"mean TTFT {statistics.mean(res.ttft_ms):.0f} ms, "
+                               f"mean {statistics.mean(res.tokens):.0f} tokens")
     except json.JSONDecodeError as e:
         res.error = f"JSON parse error: {e}"
+        log.emit("error", res.error)
+    res.transcript = log.lines
     return res
 
 
 def _run_opencode(endpoint: str, model_id: str, prompt: str, iterations: int,
-                  max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
+                  max_tokens: int, config_dir: Path, progress_cb=None,
+                  log: LabLog | None = None) -> BenchResult:
     """Run opencode with the Sisyphus (oh-my-opencode) agent against an isolated provider.
 
     The agent runs in an isolated work dir (``config_dir.parent / "opencode-work"``)
@@ -524,10 +732,12 @@ def _run_opencode(endpoint: str, model_id: str, prompt: str, iterations: int,
     Metrics from the ``--format json`` event stream: agent iterations
     (``step_finish`` events) and output tokens (per-step usage). opencode
     emits completed parts only (no per-token deltas), so TTFT is not
-    measurable and TPS is output tokens over total task time. No timeout:
-    long-running tasks run to completion.
+    measurable and TPS is output tokens over total task time. Every event
+    (steps, tool calls, assistant text) is written to the verbose transcript.
+    No timeout: long-running tasks run to completion.
     """
     cb = progress_cb or _noop
+    log = log or LabLog()
     res = BenchResult(harness="opencode", framework="", model=model_id, iterations=iterations)
     config_dir.mkdir(parents=True, exist_ok=True)
     work_dir = config_dir.parent / "opencode-work"
@@ -554,13 +764,17 @@ def _run_opencode(endpoint: str, model_id: str, prompt: str, iterations: int,
     for i in range(iterations):
         cb(f"opencode iteration {i + 1}/{iterations} (agent working in {work_dir.name})")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
+        log.emit("prompt", f"opencode iteration {i + 1}/{iterations}: Sisyphus agent "
+                           f"started (work dir {work_dir.name})")
+        log.emit("prompt", f"Prompt: {unique}")
         t0 = time.time()
         steps = 0
         out_tokens = 0
         try:
             proc = subprocess.run(
                 ["opencode", "run", unique, "-m", f"bench/{model_id}",
-                 "--agent", "Sisyphus", "--format", "json"],
+                 "--agent", "Sisyphus", "--format", "json",
+                 "--dir", str(work_dir)],
                 capture_output=True, text=True, env=env, cwd=str(work_dir),
             )
             total = time.time() - t0
@@ -572,24 +786,48 @@ def _run_opencode(endpoint: str, model_id: str, prompt: str, iterations: int,
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if ev.get("type") == "step_finish":
+                etype = ev.get("type")
+                part = ev.get("part") or {}
+                if etype == "step_start":
+                    log.emit("step", f"step {steps + 1} started")
+                elif etype == "step_finish":
                     steps += 1
-                    out_tokens += int((ev.get("part") or {}).get("tokens", {}).get("output") or 0)
+                    step_out = int((part.get("tokens") or {}).get("output") or 0)
+                    out_tokens += step_out
+                    log.emit("step", f"step {steps} finished ({step_out} output tokens this step)")
+                elif etype == "text":
+                    text = part.get("text") or ""
+                    if text.strip():
+                        log.emit("assistant", text)
+                elif etype == "tool_use":
+                    state = part.get("state") or {}
+                    status = state.get("status") or "unknown"
+                    title = state.get("title") or ""
+                    output = str(state.get("output") or "")[:300]
+                    log.emit("tool", f"{part.get('tool', 'tool')} "
+                                     f"{('· ' + title) if title else ''} → {status}"
+                             f"{(' — ' + output) if output else ''}")
             if proc.returncode == 0 and out_tokens > 0:
                 res.ok += 1
                 res.total_ms.append(total * 1000)
                 res.tokens.append(out_tokens)
                 res.agent_iters.append(steps)
+                log.emit("result", f"done: {steps} steps, {out_tokens} output tokens, "
+                                   f"{total:.1f}s total")
             else:
                 res.failed += 1
                 res.error = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-300:]
+                log.emit("error", res.error)
         except Exception as e:  # noqa: BLE001
             res.failed += 1
             res.error = str(e)[-300:]
+            log.emit("error", str(e))
+    res.transcript = log.lines
     return res
 
 
 HARNESS_RUNNERS = {
+    "raw": _run_raw,
     "pi": _run_pi,
     "omp": _run_omp,
     "opencode": _run_opencode,
@@ -608,7 +846,8 @@ def run_benchmark(framework: str, model_key: str, harness: str,
                   warmup: int = 1,
                   manager: FrameworkManager | None = None,
                   work_dir: Path | None = None,
-                  progress_cb=None) -> dict[str, Any]:
+                  progress_cb=None,
+                  log_cb=None) -> dict[str, Any]:
     """Run one (framework, model, harness) benchmark cell. Returns a result dict.
 
     ``warmup`` uncounted iterations are run first to absorb server/model warmup
@@ -616,8 +855,13 @@ def run_benchmark(framework: str, model_key: str, harness: str,
 
     ``progress_cb`` is an optional callable ``cb(stage: str)`` invoked at key
     points so a caller (e.g. the dashboard) can show live progress.
+
+    ``log_cb`` is an optional callable ``cb(kind: str, message: str)`` that
+    receives every verbose transcript line (prompt, iterations, tool calls,
+    assistant messages, final response) for a live scrolling view.
     """
     cb = progress_cb or _noop
+    log = LabLog(log_cb)
     own_manager = manager is None
     manager = manager or FrameworkManager()
     work_dir = work_dir or (BENCH_STATE_DIR / "work" / f"{framework}-{model_key}-{harness}")
@@ -625,19 +869,24 @@ def run_benchmark(framework: str, model_key: str, harness: str,
     started = time.time()
     try:
         cb(f"starting {framework} server")
+        log.emit("server", f"starting {framework} server (model {model_key})")
         endpoint, model_id = manager.ensure(framework, model_key)
         cb("server ready")
+        log.emit("server", f"server ready at {endpoint} (model {model_id})")
         runner = HARNESS_RUNNERS.get(harness)
         if runner is None:
-            return {"status": "failed", "error": f"no runner for harness '{harness}'"}
+            return {"status": "failed", "error": f"no runner for harness '{harness}'",
+                    "transcript": log.lines}
         # Warmup (uncounted) — absorbs first-request latency.
         for _ in range(max(warmup, 0)):
             cb("warmup")
-            _warmup_once(runner, harness, endpoint, model_id, prompt, max_tokens, work_dir)
+            log.emit("warmup", "warmup iteration (uncounted)")
+            _warmup_once(runner, harness, endpoint, model_id, prompt, max_tokens, work_dir, log)
         cb(f"running {harness} ({iterations} iterations)")
         res = runner(endpoint, model_id, prompt, iterations, max_tokens,
-                     work_dir / f"{harness}-config", cb)
+                     work_dir / f"{harness}-config", cb, log)
         summary = res.summary()
+        summary["files"] = _workdir_files(work_dir)
         summary.update({
             "framework": framework,
             "model": model_key,
@@ -654,10 +903,12 @@ def run_benchmark(framework: str, model_key: str, harness: str,
     except Exception as e:  # noqa: BLE001 - report any failure in the result
         return {"status": "failed", "framework": framework, "model": model_key,
                 "harness": harness, "error": str(e),
+                "transcript": log.lines,
                 "elapsed_s": round(time.time() - started, 1)}
     finally:
         if unload_after:
             cb("releasing server")
+            log.emit("server", f"releasing {framework} server (load-run-unload)")
             try:
                 manager.release(framework, model_key)
             except Exception:  # noqa: BLE001
@@ -667,10 +918,12 @@ def run_benchmark(framework: str, model_key: str, harness: str,
 
 
 def _warmup_once(runner, harness: str, endpoint: str, model_id: str,
-                 prompt: str, max_tokens: int, work_dir: Path) -> None:
+                 prompt: str, max_tokens: int, work_dir: Path,
+                 log: LabLog | None = None) -> None:
     """Run one uncounted iteration to warm up the server/model."""
     try:
-        runner(endpoint, model_id, prompt, 1, max_tokens, work_dir / f"{harness}-config")
+        runner(endpoint, model_id, prompt, 1, max_tokens, work_dir / f"{harness}-config",
+               None, log)
     except Exception:  # noqa: BLE001 - warmup failures are non-fatal
         pass
 

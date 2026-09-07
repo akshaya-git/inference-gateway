@@ -28,6 +28,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -35,7 +36,7 @@ import psutil
 import yaml
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 import benchmark_lab
 from backends import BackendInterface, build_backend
@@ -1207,17 +1208,31 @@ async def _lab_run(job_id: str, framework: str, model_key: str, harness: str,
         job["stage"] = stage
         job["stage_at"] = time.time()
 
+    def _log(kind: str, message: str) -> None:
+        # Called from the benchmark worker thread for every verbose transcript
+        # line (prompt, iterations, tool calls, assistant messages, response).
+        log = job.setdefault("live_log", [])
+        log.append({
+            "ts": time.time(), "kind": kind,
+            "message": re.sub(r"(?i)(api[_-]?key|authorization)\s*[:=]\s*\S+",
+                              r"\1=[redacted]", message),
+        })
+        del log[:-3000]
+
     try:
         result = await asyncio.to_thread(
             benchmark_lab.run_benchmark,
             framework, model_key, harness,
             iterations, max_tokens, prompt,
-            True, 1, _lab_manager, None, _progress,
+            True, 1, _lab_manager, None, _progress, _log,
         )
         job["result"] = result
         job["status"] = "done" if result.get("status") == "success" else "failed"
         job["stage"] = "complete"
         record = {"id": job_id, "created_at": job["created_at"], **result}
+        # Cap the stored transcript so 200 history records can't blow up memory.
+        if isinstance(record.get("transcript"), list) and len(record["transcript"]) > 1500:
+            record["transcript"] = record["transcript"][-1500:]
         lab_history.insert(0, record)
         del lab_history[200:]
     except Exception as e:  # noqa: BLE001
@@ -1280,6 +1295,31 @@ async def lab_status(job_id: str):
 @app.get("/lab/results")
 async def lab_results():
     return {"jobs": list(lab_jobs.values()), "history": lab_history}
+
+
+@app.get("/lab/file")
+async def lab_file(job_id: str, path: str):
+    """Serve a file generated in a lab job's work dir (path-traversal safe).
+
+    HTML files are served as text/html so the browser renders them; other
+    files are served as plain text.
+    """
+    job = lab_jobs.get(job_id)
+    result = (job or {}).get("result") or next(
+        (h.get("result") for h in lab_history if h.get("id") == job_id), None)
+    work_dir = (result or {}).get("work_dir") or ""
+    if not work_dir:
+        return JSONResponse({"error": "job has no work dir"}, status_code=404)
+    base = Path(work_dir).resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base) + os.sep) or not target.is_file():
+        return JSONResponse({"error": "file not found in work dir"}, status_code=404)
+    if target.stat().st_size > 5_000_000:
+        return JSONResponse({"error": "file too large to view"}, status_code=413)
+    name = target.name.lower()
+    if name.endswith(".html") or name.endswith(".htm"):
+        return HTMLResponse(target.read_text(errors="replace"))
+    return PlainTextResponse(target.read_text(errors="replace"))
 
 
 @app.post("/lab/clear")
@@ -2532,6 +2572,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0c1015;border:1px sol
 .comparegrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.output{max-width:none;min-height:220px;max-height:520px}.meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);margin:8px 0}.comparehead{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:11px}
 .score{font-size:34px;font-weight:800;margin:8px 0}.rubric{display:grid;grid-template-columns:1fr auto;gap:7px;border-top:1px solid var(--line);padding:7px 0}.checks{margin:5px 0 12px;padding-left:18px;color:var(--muted)}.checks .pass{color:var(--green)}.checks .fail{color:var(--red)}
 .verdicts{display:flex;gap:12px;flex-wrap:wrap;margin:7px 0 12px}.verdicts label{display:flex;gap:5px;align-items:center}.verdicts input[type=radio]{padding:0;margin:0}
+.labmodal{position:fixed;inset:0;background:rgba(4,8,12,.78);display:none;align-items:center;justify-content:center;z-index:50;padding:28px}.labmodal.on{display:flex}.labmodalbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;width:min(1100px,100%);max-height:92vh;display:flex;flex-direction:column}.labmodalhead{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line)}.labmodalhead h3{margin:0;font-size:16px}.labmodalbody{padding:16px 18px;overflow:auto}.labmodalbody pre{max-width:none;max-height:64vh;min-height:120px;font-size:12px;line-height:1.45}.labfilelist{display:flex;flex-direction:column;gap:8px}.labfilelist button{justify-content:space-between;text-align:left;width:100%}
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}header{align-items:start;flex-direction:column;gap:6px}main,header{padding-left:15px;padding-right:15px}nav{padding-left:15px}}
 @media(max-width:760px){.comparegrid{grid-template-columns:1fr}}
 </style></head><body>
@@ -2557,7 +2598,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0c1015;border:1px sol
  <section><h2>Results</h2><p class=muted>Total time includes loading and the full Pi run. Tool calls count all executed tools, including retries. Average generation TPS = total output tokens / summed generation time across model calls; excludes tool execution and per-call time to first token. Older runs without generation timing show —.</p><table><thead><tr><th>Time</th><th>Suite</th><th>Route</th><th>Model</th><th>Readiness</th><th>Evidence</th><th>Load/readiness</th><th>TTFT</th><th>Total time incl. load</th><th>Pi run time</th><th>Tool calls</th><th>Model calls</th><th>Prompt tokens</th><th>Completion</th><th>Average generation TPS</th><th>Available before → after</th><th>Swap written</th><th>Compute</th></tr></thead><tbody id=benchRows></tbody></table></section>
 </div>
 <div class=tab id=lab>
- <div class=card><div class=suite><div><h2>Multi-axis benchmark lab</h2><div class=muted>Measure one (model × framework × harness) cell. Frameworks: oMLX (resident), MTPLX, llama.cpp — all load Qwen3.8 27B with MTP, 240K context, 32K max tokens. Harnesses: pi, omp, opencode (Sisyphus) — full agents, no timeout limits. The framework loads the model, runs the harness, then the gateway drops the model copy (load-run-unload residency). Jobs run sequentially. Incompatible model×framework combos are greyed out, not errored.</div></div><button class="action primary" id=runLab onclick=runLabCell()>Run cell</button></div>
+ <div class=card><div class=suite><div><h2>Multi-axis benchmark lab</h2><div class=muted>Measure one (model × framework × harness) cell. Frameworks: oMLX (resident), MTPLX, llama.cpp — all load Qwen3.8 27B with MTP, 240K context, 32K max tokens. Harnesses: raw (streaming HTTP baseline), pi (full agent, tools enabled), omp (bench — request-level, no tools/file writes), opencode (Sisyphus agent). No timeout limits. The framework loads the model, runs the harness, then the gateway drops the model copy (load-run-unload residency). Jobs run sequentially. Incompatible model×framework combos are greyed out, not errored.</div></div><button class="action primary" id=runLab onclick=runLabCell()>Run cell</button></div>
  <div class=actions>
   <label>Model <select id=labModel onchange=applyLabAvailability()></select></label>
   <label>Framework <select id=labFramework onchange=applyLabAvailability()></select></label>
@@ -2570,8 +2611,10 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0c1015;border:1px sol
  <div class=muted id=labMsg>Configure a cell and run it. Results appear below.</div>
  </div>
  <section><h2>Current lab job</h2><div id=labJob class=notice>No lab job running.</div></section>
- <section><h2>Lab results</h2><p class=muted>TTFT = time to first token (pi: first streamed delta; omp: per-request; opencode: not measurable — completed parts only, shown as —). TPS = output tokens over decode time (pi, omp) or over total task time (opencode). Agent iters = number of agent turns/steps the harness performed (pi: turns; omp: 1 per request; opencode: steps). Token counts are exact (from provider usage).</p><table><thead><tr><th>Time</th><th>Model</th><th>Framework</th><th>Harness</th><th>Status</th><th>TTFT</th><th>Total</th><th>Tokens</th><th>TPS</th><th>Agent iters</th><th>Iters</th><th>Error</th></tr></thead><tbody id=labRows></tbody></table></section>
-</div></main>
+ <section><h2>Live lab output</h2><div class=muted>Everything the harness does after the prompt is sent: server startup, every iteration/loop, tool calls with arguments, assistant messages, and the final response. Scrolls live while the job runs; use “Output” on a finished row to re-view the full transcript.</div><pre class=output id=labLiveLog style="max-height:380px">No lab activity yet.</pre></section>
+ <section><h2>Lab results</h2><p class=muted>TTFT = time to first token (raw: first streamed delta; pi: first streamed delta; omp: per-request; opencode: not measurable — completed parts only, shown as —). TPS = output tokens over decode time (raw, pi, omp) or over total task time (opencode). Agent iters = number of agent turns/steps the harness performed (raw: 1 per request; pi: turns; omp: 1 per request; opencode: steps). Token counts are exact (from provider usage). “Output” opens the full verbose transcript; “Files” lists files the agent generated in its work dir (omp/raw never generate files — they are request-level harnesses).</p><table><thead><tr><th>Time</th><th>Model</th><th>Framework</th><th>Harness</th><th>Status</th><th>TTFT</th><th>Total</th><th>Tokens</th><th>TPS</th><th>Agent iters</th><th>Iters</th><th>Output</th><th>Files</th><th>Error</th></tr></thead><tbody id=labRows></tbody></table></section>
+</div>
+<div class=labmodal id=labModal onclick="if(event.target===this)closeLabModal()"><div class=labmodalbox><div class=labmodalhead><h3 id=labModalTitle>Output</h3><button class=action onclick=closeLabModal()>Close</button></div><div class=labmodalbody id=labModalBody></div></div></div></main>
 <script>
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),sec=x=>x==null?'—':(x/1000).toFixed(2)+'s',val=(x,d='—')=>x==null?d:x;
 let suiteData={},benchmarkResults=[],benchmarkJobs=[],selectedCompareJob='',verdictDrafts={};function showPrompt(){const x=suiteData[$('suite').value];if(x){const subjects=x.subjects||[];$('portraitLabel').style.display=subjects.length?'':'none';if(subjects.length&&!$('portraitSubject').options.length){$('portraitSubject').innerHTML=subjects.map(name=>`<option>${esc(name)}</option>`).join('')}$('promptEditor').value=x.prompt_template?x.prompt_template.replace('{figure}',$('portraitSubject').value):x.prompt;$('profileHint').textContent=`Pi agent profile: thinking ${x.thinking?'on':'off'} · reasoning ${x.reasoning_effort} · 128K context · up to 32,000 output tokens. The prompt and environment are identical for each selected model.`}}function resetPrompt(){showPrompt();$('benchMsg').textContent='Standard prompt restored.'}
@@ -2600,14 +2643,22 @@ $('historyRows').innerHTML=h.slice().reverse().slice(0,100).map(x=>`<tr><td>${ne
 const suites=b.suites||{};suiteData=suites;if(!$('suite').options.length){$('suite').innerHTML=Object.entries(suites).map(([id,x])=>`<option value=${esc(id)}>${esc(x.name)} — ${esc(x.description)}</option>`).join('');showPrompt()}const jobs=b.jobs||[];renderLivePi(jobs);$('jobRows').innerHTML=jobs.slice().reverse().map(j=>`<tr><td>${new Date(j.created_at*1000).toLocaleTimeString()}</td><td>${esc(j.suite)}</td><td>${esc(j.routes.join(', '))}</td><td class=${j.status==='failed'?'bad':j.status==='complete'?'good':'warn'}>${esc(j.status)}</td><td>${esc(j.stage||j.current_route||'—')}</td><td>${esc(j.error||j.restore_error||'—')}</td></tr>`).join('')||'<tr><td colspan=6>No benchmark jobs</td></tr>';$('runBench').disabled=a.length>0||jobs.some(j=>['queued','running'].includes(j.status));benchmarkResults=b.history||[];const groups=[...new Set(benchmarkResults.map(x=>x.job_id).filter(Boolean))].reverse();const prior=$('compareJob').value;$('compareJob').innerHTML='<option value="">Choose a completed run</option>'+groups.map(id=>{const x=benchmarkResults.find(r=>r.job_id===id);return `<option value="${esc(id)}">${esc(x?.suite||'benchmark')} · ${new Date((x?.ts||0)*1000).toLocaleString()}</option>`}).join('');if(selectedCompareJob&&groups.includes(selectedCompareJob)){selectComparison(selectedCompareJob)}else if(prior&&groups.includes(prior)){selectComparison(prior)}$('benchRows').innerHTML=benchmarkResults.slice().reverse().map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${esc(x.suite)}</td><td>${esc(x.route)}</td><td>${esc(x.model)}</td><td><b>${x.evaluation?.readiness_score??'—'}</b>${x.evaluation?' / 100':''}</td><td><button class=action onclick="selectComparison('${esc(x.job_id||'')}')">Compare output</button></td><td>${sec(x.swap_ms)}</td><td>${sec(x.ttft_ms)}</td><td>${sec(x.total_time_ms??(x.latency_ms==null?null:x.latency_ms+(x.swap_ms||0)))}</td><td>${sec(x.latency_ms)}</td><td>${val(x.pi_tool_calls)}</td><td>${val(x.pi_model_requests)}</td><td>${val(x.prompt_tokens)}</td><td>${val(x.completion_tokens)}</td><td>${val(x.average_tps)}</td><td>${val(x.available_before_gb)} → ${val(x.available_after_gb)} GiB</td><td>${x.swap_delta_mb==null?'Unavailable':x.swap_delta_mb+' MB'}</td><td>${val(x.compute_score)}</td></tr>`).join('')||'<tr><td colspan=18>No benchmark results</td></tr>'}
 async function tick(){try{const r=await fetch('/metrics',{cache:'no-store'}),d=await r.json();benchmarkJobs=d.benchmarks?.jobs||[];render(d);enforceComparisonLocks()}catch(e){$('status').textContent='Dashboard error: '+e.message}}setInterval(tick,1200);tick();
 // ---- 3-Axis Lab ----
-let labJobId=null,labPollTimer=null,labOptions=null;
+let labJobId=null,labPollTimer=null,labOptions=null,labJobsCache=[],labHistoryCache=[];
 async function loadLabOptions(){try{const r=await fetch('/lab/options',{cache:'no-store'}),o=await r.json();const fill=(id,items)=>{const el=$(id);if(!el)return;const cur=el.value;el.innerHTML=items.map(x=>`<option value="${esc(x.key)}">${esc(x.label)}</option>`).join('');if([...el.options].some(x=>x.value===cur))el.value=cur};fill('labModel',o.models);fill('labFramework',o.frameworks);fill('labHarness',o.harnesses);labOptions=o;if($('labPrompt')&&!$('labPrompt').value)$('labPrompt').value=o.default_prompt||'';applyLabAvailability()}catch(e){$('labMsg').textContent='Failed to load lab options: '+e.message}}
 function applyLabAvailability(){if(!labOptions)return;const model=$('labModel'),framework=$('labFramework');if(!model||!framework)return;const mSpec=labOptions.models.find(m=>m.key===model.value);for(const opt of framework.options){const ok=!mSpec||!!mSpec.frameworks[opt.value];opt.disabled=!ok}if(framework.options[framework.selectedIndex]&&framework.options[framework.selectedIndex].disabled){const first=[...framework.options].find(o=>!o.disabled);if(first)framework.value=first.value}}
-async function renderLabResults(){try{const r=await fetch('/lab/results',{cache:'no-store'}),d=await r.json();const rows=(d.history||[]).map(x=>`<tr><td>${new Date((x.created_at||0)*1000).toLocaleTimeString()}</td><td>${esc(x.model)}</td><td>${esc(x.framework)}</td><td>${esc(x.harness)}</td><td class=${x.status==='success'?'good':'bad'}>${esc(x.status)}</td><td>${x.avg_ttft_ms==null?'—':sec(x.avg_ttft_ms)}</td><td>${x.avg_total_ms==null?'—':sec(x.avg_total_ms)}</td><td>${val(x.avg_tokens)}</td><td>${x.avg_tps?x.avg_tps.toFixed(1):'—'}</td><td>${val(x.avg_agent_iters)}</td><td>${val(x.iterations)}</td><td class=reason>${esc(x.error||'')}</td></tr>`).join('');$('labRows').innerHTML=rows||'<tr><td colspan=12>No lab results yet</td></tr>'}catch(e){}}
-async function runLabCell(){const framework=$('labFramework').value,model=$('labModel').value,harness=$('labHarness').value,iterations=parseInt($('labIters').value,10)||3,max_tokens=parseInt($('labMaxTok').value,10)||32768,prompt=($('labPrompt')?$('labPrompt').value:'');$('runLab').disabled=true;$('labMsg').textContent='Queuing lab cell…';try{const r=await fetch('/lab/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({framework,model,harness,iterations,max_tokens,prompt})});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);labJobId=d.id;pollLabJob(d.id)}catch(e){$('labMsg').textContent='Error: '+e.message;$('runLab').disabled=false}}
-async function pollLabJob(jobId){clearInterval(labPollTimer);labPollTimer=setInterval(async()=>{try{const r=await fetch('/lab/status/'+encodeURIComponent(jobId),{cache:'no-store'}),j=await r.json();const wd=j.result&&j.result.work_dir?` · output: <code>${esc(j.result.work_dir)}</code>`:'';$('labJob').innerHTML=`<b>${esc(j.framework)} × ${esc(j.model)} × ${esc(j.harness)}</b> — status: <span class=${j.status==='failed'?'bad':j.status==='done'?'good':'warn'}>${esc(j.status)}</span> · stage: ${esc(j.stage||'—')}${j.result&&j.result.status==='success'?` · TTFT ${j.result.avg_ttft_ms==null?'—':sec(j.result.avg_ttft_ms)} · total ${sec(j.result.avg_total_ms)} · ${val(j.result.avg_tokens)} tok · ${j.result.avg_tps?j.result.avg_tps.toFixed(1):'—'} t/s · ${val(j.result.avg_agent_iters)} agent iters${wd}`:''}${j.status==='running'&&j.stage_at?` <span class=muted>(updated ${Math.round((Date.now()/1000-j.stage_at))}s ago)</span>`:''}`;if(j.status==='done'||j.status==='failed'){clearInterval(labPollTimer);labPollTimer=null;$('runLab').disabled=false;$('labMsg').textContent=j.status==='done'?'Lab cell complete.':'Lab cell failed: '+(j.result?.error||'unknown');renderLabResults()}}catch(e){}},1500)}
+function renderLabLive(jobs){const job=[...jobs].reverse().find(j=>['queued','running'].includes(j.status))||jobs[jobs.length-1],lines=job?.live_log||[];const el=$('labLiveLog');if(!el)return;if(!lines.length){el.textContent='No lab activity yet.';return}const wasNearBottom=el.scrollHeight-el.scrollTop-el.clientHeight<45;el.textContent=lines.map(x=>`[${new Date(x.ts*1000).toLocaleTimeString()}] ${x.kind}: ${x.message}`).join('\n');if(wasNearBottom)el.scrollTop=el.scrollHeight}
+async function refreshLabJobs(){try{const r=await fetch('/lab/results',{cache:'no-store'}),d=await r.json();labJobsCache=d.jobs||[];labHistoryCache=d.history||[];renderLabLive(labJobsCache);return d}catch(e){return null}}
+async function renderLabResults(){const d=await refreshLabJobs();const history=d?.history||[];const rows=history.map(x=>{const files=(x.files||[]).length;return `<tr><td>${new Date((x.created_at||0)*1000).toLocaleTimeString()}</td><td>${esc(x.model)}</td><td>${esc(x.framework)}</td><td>${esc(x.harness)}</td><td class=${x.status==='success'?'good':'bad'}>${esc(x.status)}</td><td>${x.avg_ttft_ms==null?'—':sec(x.avg_ttft_ms)}</td><td>${x.avg_total_ms==null?'—':sec(x.avg_total_ms)}</td><td>${val(x.avg_tokens)}</td><td>${x.avg_tps?x.avg_tps.toFixed(1):'—'}</td><td>${val(x.avg_agent_iters)}</td><td>${val(x.iterations)}</td><td><button class=action onclick="showLabOutput('${esc(x.id)}')">Output</button></td><td><button class=action onclick="showLabFiles('${esc(x.id)}')">${files?files+' file'+(files>1?'s':''):'—'}</button></td><td class=reason>${esc(x.error||'')}</td></tr>`}).join('');$('labRows').innerHTML=rows||'<tr><td colspan=14>No lab results yet</td></tr>'}
+function openLabModal(title,html){$('labModalTitle').textContent=title;$('labModalBody').innerHTML=html;$('labModal').classList.add('on')}
+function closeLabModal(){$('labModal').classList.remove('on')}
+function findLabRecord(id){const job=labJobsCache.find(j=>j.id===id);if(job?.result)return job.result;return labHistoryCache.find(x=>x.id===id)||null}
+async function showLabOutput(id){await refreshLabJobs();const r=await fetch('/lab/status/'+encodeURIComponent(id),{cache:'no-store'});const job=r.ok?await r.json():null;const result=job?.result||findLabRecord(id);let lines=[];if(result?.transcript?.length)lines=result.transcript;else if(job?.live_log?.length)lines=job.live_log.map(x=>`[${new Date(x.ts*1000).toLocaleTimeString()}] ${x.kind}: ${x.message}`);openLabModal(`Full output — ${job?.framework||result?.framework||''} × ${job?.harness||result?.harness||''}`,`<pre>${esc(lines.join('\n')||'No transcript captured for this run.')}</pre>`)}
+async function showLabFiles(id){await refreshLabJobs();const r=await fetch('/lab/status/'+encodeURIComponent(id),{cache:'no-store'});const job=r.ok?await r.json():null;const result=job?.result||findLabRecord(id);const files=result?.files||[];if(!files.length){openLabModal('Generated files',`<div class=notice>No files were generated in the work dir. Note: raw and omp are request-level harnesses — they never write files. Use pi or opencode for agent tasks that produce files.</div><div class=muted>Work dir: ${esc(result?.work_dir||'—')}</div>`);return}const list=files.map(f=>`<button class=action onclick="showLabFile('${esc(id)}','${esc(f.name)}')"><span>${esc(f.name)}</span><span class=muted>${(f.size/1024).toFixed(1)} KB</span></button>`).join('');openLabModal('Generated files',`<div class=muted>Work dir: ${esc(result?.work_dir||'—')} — click a file to view it (HTML opens rendered in a new tab).</div><div class=labfilelist>${list}</div>`)}
+async function showLabFile(id,name){const url='/lab/file?job_id='+encodeURIComponent(id)+'&path='+encodeURIComponent(name);if(/\.html?$/i.test(name)){window.open(url,'_blank','noopener,noreferrer');return}try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw Error((await r.json()).error||r.statusText);openLabModal(name,`<pre>${esc(await r.text())}</pre>`)}catch(e){openLabModal(name,`<div class="notice bad">Could not load file: ${esc(e.message)}</div>`)}}
+async function runLabCell(){const framework=$('labFramework').value,model=$('labModel').value,harness=$('labHarness').value,iterations=parseInt($('labIters').value,10)||3,max_tokens=parseInt($('labMaxTok').value,10)||32768,prompt=($('labPrompt')?$('labPrompt').value:'');$('runLab').disabled=true;$('labMsg').textContent='Queuing lab cell…';$('labLiveLog').textContent='Queued — waiting to start…';try{const r=await fetch('/lab/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({framework,model,harness,iterations,max_tokens,prompt})});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);labJobId=d.id;pollLabJob(d.id)}catch(e){$('labMsg').textContent='Error: '+e.message;$('runLab').disabled=false}}
+async function pollLabJob(jobId){clearInterval(labPollTimer);labPollTimer=setInterval(async()=>{try{const r=await fetch('/lab/status/'+encodeURIComponent(jobId),{cache:'no-store'}),j=await r.json();labJobsCache=[...labJobsCache.filter(x=>x.id!==jobId),j];renderLabLive(labJobsCache);const wd=j.result&&j.result.work_dir?` · output: <code>${esc(j.result.work_dir)}</code>`:'';const nf=j.result&&j.result.files&&j.result.files.length?` · ${j.result.files.length} file(s) generated`:'';$('labJob').innerHTML=`<b>${esc(j.framework)} × ${esc(j.model)} × ${esc(j.harness)}</b> — status: <span class=${j.status==='failed'?'bad':j.status==='done'?'good':'warn'}>${esc(j.status)}</span> · stage: ${esc(j.stage||'—')}${j.result&&j.result.status==='success'?` · TTFT ${j.result.avg_ttft_ms==null?'—':sec(j.result.avg_ttft_ms)} · total ${sec(j.result.avg_total_ms)} · ${val(j.result.avg_tokens)} tok · ${j.result.avg_tps?j.result.avg_tps.toFixed(1):'—'} t/s · ${val(j.result.avg_agent_iters)} agent iters${nf}${wd}`:''}${j.status==='running'&&j.stage_at?` <span class=muted>(updated ${Math.round((Date.now()/1000-j.stage_at))}s ago)</span>`:''}`;if(j.status==='done'||j.status==='failed'){clearInterval(labPollTimer);labPollTimer=null;$('runLab').disabled=false;$('labMsg').textContent=j.status==='done'?'Lab cell complete.':'Lab cell failed: '+(j.result?.error||'unknown');renderLabResults()}}catch(e){}},1500)}
 async function clearLabHistory(){try{const r=await fetch('/lab/clear',{method:'POST'});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);renderLabResults()}catch(e){$('labMsg').textContent='Error: '+e.message}}
-loadLabOptions();renderLabResults();
+loadLabOptions();renderLabResults();setInterval(()=>{if(labPollTimer)return;refreshLabJobs()},5000);
 </script></body></html>"""
 
 @app.get("/", response_class=HTMLResponse)
