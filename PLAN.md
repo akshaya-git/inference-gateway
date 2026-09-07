@@ -263,3 +263,36 @@ requiring GUI interaction or credentials is handed to the owner as explicit comm
   llama.cpp×raw TTFT ~90 ms / ~97 TPS; oMLX×omp TTFT ~478 ms / ~83 TPS).
 - **Tests**: 127 passed, 10 deselected; ruff clean. Gateway restarted; `/lab/*`
   API + dashboard verified live.
+
+## CP-5 addendum: lab restructure (2026-09-07, owner decision)
+
+The lab was narrowed to the MTP comparison the owner actually wants:
+
+- **Frameworks: 3** — `omlx`, `mtplx`, `llamacpp`. Dropped: `mlx`
+  (`mlx_lm.server` strips `mtp.*` weights — no MTP spec decoding, so it can't
+  represent the MTP model) and `ollama` (redundant with llama.cpp).
+- **Model: 1** — `qwen3.8-27b` (Qwen3.8 27B, 6-bit, MTP) across all 3
+  frameworks. The MoE model (`qwen3.6-35b-a3b`) is dropped from the lab.
+- **Harnesses: 3** — `pi`, `omp`, `opencode` (renamed from `sisyphus`).
+  Dropped: `raw`, `bionic`, `dsh`.
+- **Budget: 240K context / 32K max tokens / MTP enabled** on every framework:
+  llama.cpp `--ctx-size 245760 --n-predict 32768 --spec-type draft-mtp`;
+  MTPLX `--context-window 245760 --max-tokens 32768`; oMLX settings applied
+  via `PUT /admin/api/models/{id}/settings` in `ensure()` (in place, no
+  unload). Harness provider configs use the same budget.
+- **No timeout limits** — benchmarks run long-running tasks; no harness
+  subprocess has a timeout.
+- **New metrics: agent iterations + total time** per harness, alongside TTFT
+  and TPS. pi now runs as a **full agent (tools enabled)** in an isolated
+  work dir and parses its `--mode json` event stream live: `turn_end` =
+  iterations, `message_end` usage = exact tokens, first delta = TTFT.
+  opencode counts `step_finish` steps (TTFT not measurable — completed parts
+  only). omp: 1 iteration per request.
+- **Residency:** the gateway drops the previous framework's model copy when a
+  cell finishes (load-run-unload), so the next framework starts clean.
+- **Dashboard:** results table gains an **Agent iters** column; max-tokens
+  input defaults to 32768 (range 16–32768).
+- Smoke-tested live: omlx×pi (TTFT 5.7 s, 17 tok, 1 iter), omlx×opencode
+  (189 tok, 1 iter), mtplx×omp (28.7 TPS), llamacpp×omp (15.2 TPS). All
+  transient servers released after their cells; oMLX routing model stayed
+  resident. 137 tests pass.

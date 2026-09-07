@@ -1,22 +1,25 @@
 """
 Multi-axis benchmark lab: model x framework x harness.
 
-Frameworks (serving backends, all OpenAI-compatible):
+Frameworks (serving backends, all OpenAI-compatible, all MTP-enabled):
   - omlx:     resident oMLX server (:8000); full load/unload residency via admin API
-  - mlx:      mlx_lm.server; model fixed at start (start/stop == load/unload)
-  - llamacpp: llama-server; model fixed at start (start/stop == load/unload)
-  - ollama:   ollama serve; models pulled, auto-load on first request
+  - mtplx:    MTPLX (native MTP speculative decoding); model fixed at start
+  - llamacpp: llama-server with --spec-type draft-mtp; model fixed at start
 
 Harnesses (agent wrappers around the model):
-  - raw:      direct HTTP to /v1/chat/completions (baseline, no harness overhead)
+  - pi:       pi CLI, full agent (tools enabled), --mode json event stream
   - omp:      omp CLI (pi fork; built-in `bench` workload)
-  - pi:       pi CLI
-  - sisyphus: opencode + oh-my-opencode plugin
-  - dsh:      deepseek harness (npx @deepseek-ai/dsh)
+  - opencode: opencode + oh-my-opencode plugin (Sisyphus agent)
 
 Residency model (load-run-unload): only the model under test is loaded in a
 non-resident framework, on top of the always-resident oMLX routing models.
-This keeps RAM bounded so benchmarks can run while the gateway stays usable.
+When a cell finishes, the gateway drops the framework's model copy, so the
+next framework starts from a clean slate (no duplicate model copies in RAM).
+
+Metrics captured per cell: TTFT, TPS, output tokens, total time, and the
+number of agent iterations (turns/steps) each harness performed. Benchmarks
+run long-running tasks with NO timeout limits; every framework loads the
+model with a 240K context window and 32K max output tokens, MTP enabled.
 """
 from __future__ import annotations
 
@@ -36,13 +39,10 @@ import httpx
 PROJECT_DIR = Path(__file__).resolve().parent
 MODELS_DIR = PROJECT_DIR / "models"
 GGUF_DIR = MODELS_DIR / "gguf"
-HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
-MLX_VENV = Path.home() / ".omlx" / "bench-venv"
-MLX_SERVER = MLX_VENV / "bin" / "mlx_lm.server"
 BENCH_STATE_DIR = PROJECT_DIR / ".inference-stack" / "bench"
 
 # Benchmark context/output budget (applied to every framework server).
-CONTEXT_WINDOW = 131072   # 131K context (large prefill support)
+CONTEXT_WINDOW = 245760    # 240K context window
 MAX_OUTPUT_TOKENS = 32768  # 32K max output tokens
 
 # ---------------------------------------------------------------------------
@@ -50,63 +50,33 @@ MAX_OUTPUT_TOKENS = 32768  # 32K max output tokens
 # ---------------------------------------------------------------------------
 
 
-def _mlx_snapshot(repo: str) -> str:
-    """Resolve the single HF snapshot dir for an MLX model repo."""
-    base = HF_CACHE / f"models--{repo}" / "snapshots"
-    if base.exists():
-        snaps = [p for p in base.iterdir() if p.is_dir()]
-        if snaps:
-            return str(snaps[0])
-    return str(base / "unknown")
-
-
 MODELS: dict[str, dict[str, Any]] = {
-    "qwen3.6-35b-a3b": {
-        "label": "Qwen3.6 35B-A3B (6-bit)",
-        "artifacts": {
-            "omlx": {"id": "mlx-community--Qwen3.6-35B-A3B-6bit"},
-            "mlx": {"path": _mlx_snapshot("mlx-community--Qwen3.6-35B-A3B-6bit"),
-                    "id": "mlx-community/Qwen3.6-35B-A3B-6bit"},
-            "llamacpp": {"path": str(GGUF_DIR / "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),
-                         "id": "qwen3_6_35b_a3b"},
-            "ollama": {"name": "bench/qwen36-35b-a3b-q6",
-                       "gguf": str(GGUF_DIR / "Qwen3.6-35B-A3B-UD-Q6_K.gguf")},
-        },
-    },
     "qwen3.8-27b": {
         "label": "Qwen3.8 27B (6-bit, MTP)",
         "artifacts": {
             "omlx": {"id": "scottlowry--Qwen3.8-27B-oQ6e-mtp"},
-            # MTP MLX model (same OptiQ 6-bit MTP build oMLX serves; MLX-format,
-            # native 256K context, mtp_num_hidden_layers=1). Already in HF cache.
-            "mlx": {"path": _mlx_snapshot("scottlowry--Qwen3.8-27B-oQ6e-mtp"),
-                    "id": "scottlowry/Qwen3.8-27B-oQ6e-mtp"},
             # MTPLX: native MTP speculative-decoding build (its own artifact).
             "mtplx": {"id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality"},
-            # MTP GGUF (Q6_K) for llama.cpp / Ollama.
+            # MTP GGUF (Q6_K) for llama.cpp (--spec-type draft-mtp).
             "llamacpp": {"path": str(GGUF_DIR / "Qwen3.8-27B-MTP-Q6_K.gguf"),
                          "id": "qwen3_8_27b"},
-            "ollama": {"name": "bench/qwen38-27b-q6",
-                       "gguf": str(GGUF_DIR / "Qwen3.8-27B-MTP-Q6_K.gguf")},
         },
     },
 }
 
 FRAMEWORKS: dict[str, dict[str, Any]] = {
     "omlx": {"port": 8000, "resident": True, "label": "oMLX (resident)"},
-    "mlx": {"port": 8200, "resident": False, "label": "MLX (mlx_lm.server)"},
     "mtplx": {"port": 8400, "resident": False, "label": "MTPLX (MTP MLX)"},
     "llamacpp": {"port": 8300, "resident": False, "label": "llama.cpp (llama-server)"},
-    # Ollama dropped from the lab (redundant with llama.cpp for GGUF models).
+    # Dropped: mlx (mlx_lm.server strips MTP weights — no MTP spec decoding),
+    # ollama (redundant with llama.cpp for GGUF models).
 }
 
 HARNESSES: dict[str, dict[str, Any]] = {
-    "raw": {"label": "raw HTTP (baseline)", "available": True},
-    "bionic": {"label": "Bionic (LM Studio GUI)", "available": True},
-    "omp": {"label": "omp", "available": shutil.which("omp") is not None},
     "pi": {"label": "pi", "available": shutil.which("pi") is not None},
-    "sisyphus": {"label": "Sisyphus (opencode)", "available": shutil.which("opencode") is not None},
-    "dsh": {"label": "dsh (deepseek harness)", "available": shutil.which("npx") is not None},
+    "omp": {"label": "omp", "available": shutil.which("omp") is not None},
+    "opencode": {"label": "opencode (Sisyphus)", "available": shutil.which("opencode") is not None},
+    # Dropped: raw (baseline), bionic (LM Studio GUI), dsh (deepseek harness).
 }
 
 # Standard benchmark prompt (unique suffix added per iteration to avoid cache).
@@ -137,12 +107,6 @@ def server_model_path(framework: str, model_key: str) -> str:
     """The on-disk model path used to start a server framework (may be empty)."""
     art = _artifact(framework, model_key) or {}
     return art.get("path", "")
-
-
-def ollama_gguf(model_key: str) -> str:
-    """The GGUF path used to create an Ollama model for a logical model."""
-    art = _artifact("ollama", model_key) or {}
-    return art.get("gguf", "")
 
 
 def framework_available_for(framework: str, model_key: str) -> bool:
@@ -179,8 +143,6 @@ class FrameworkManager:
         ep = self.endpoint(framework)
         if framework == "omlx":
             return self._http_ok(f"{ep}/admin/api/models")
-        if framework == "ollama":
-            return self._http_ok(f"{ep}/api/tags")
         return self._http_ok(f"{ep}/health") or self._http_ok(f"{ep}/v1/models")
 
     def _wait_healthy(self, framework: str, timeout: float) -> bool:
@@ -209,17 +171,25 @@ class FrameworkManager:
         except httpx.HTTPError:
             pass
 
-    # -- server frameworks (mlx, llamacpp) --------------------------------
+    def _omlx_apply_settings(self, model_id: str) -> None:
+        """Apply the benchmark context/output budget to the oMLX model.
+
+        Safe on a loaded model (settings update in place, no unload).
+        """
+        try:
+            httpx.put(
+                f"{self.endpoint('omlx')}/admin/api/models/{model_id}/settings",
+                json={"max_context_window": CONTEXT_WINDOW,
+                      "max_tokens": MAX_OUTPUT_TOKENS},
+                timeout=30,
+            ).raise_for_status()
+        except httpx.HTTPError:
+            pass  # non-fatal: the model keeps its current settings
+
+    # -- server frameworks (mtplx, llamacpp) --------------------------------
 
     def _server_cmd(self, framework: str, model_key: str) -> list[str]:
         port = FRAMEWORKS[framework]["port"]
-        if framework == "mlx":
-            model_ref = server_model_path("mlx", model_key)
-            # mlx_lm.server: context is the model's native window (256K for the
-            # MTP build); --max-tokens caps default output. KV cache grows lazily.
-            return [str(MLX_SERVER), "--model", model_ref,
-                    "--host", "127.0.0.1", "--port", str(port),
-                    "--max-tokens", str(MAX_OUTPUT_TOKENS)]
         if framework == "llamacpp":
             model_ref = server_model_path("llamacpp", model_key)
             alias = model_id_for("llamacpp", model_key)
@@ -228,6 +198,7 @@ class FrameworkManager:
             return ["llama-server", "-m", model_ref,
                     "--host", "127.0.0.1", "--port", str(port),
                     "--alias", alias, "--ctx-size", str(CONTEXT_WINDOW),
+                    "--n-predict", str(MAX_OUTPUT_TOKENS),
                     "--spec-type", "draft-mtp"]
         if framework == "mtplx":
             model_id = model_id_for("mtplx", model_key)
@@ -267,18 +238,18 @@ class FrameworkManager:
             info = models.get(model_id)
             if info is None:
                 raise RuntimeError(f"model {model_id} not registered in oMLX")
+            # Apply the 240K/32K benchmark budget (in place; no unload).
+            self._omlx_apply_settings(model_id)
             if not info.get("loaded") and not info.get("is_loading"):
                 self._omlx_load(model_id)
                 self._wait_loaded_omlx(model_id, load_timeout)
             return self.endpoint("omlx"), model_id
 
-        if framework == "ollama":
-            return self._ensure_ollama(model_key)
-
-        # mlx / llamacpp: one server per framework, model fixed at start.
+        # mtplx / llamacpp: one server per framework, model fixed at start.
         if self._server_model.get(framework) == model_key and self.health(framework):
             return self.endpoint(framework), model_id_for(framework, model_key)
-        # Restart if running a different model or not healthy.
+        # Restart if running a different model or not healthy (drops the
+        # previous model copy before loading the new one).
         self._stop_server(framework)
         cmd = self._server_cmd(framework, model_key)
         log_path = BENCH_STATE_DIR / f"{framework}.log"
@@ -308,52 +279,14 @@ class FrameworkManager:
             time.sleep(1.0)
         raise RuntimeError(f"oMLX model {model_id} did not load in {timeout}s")
 
-    def _ensure_ollama(self, model_key: str) -> tuple[str, str]:
-        ep = self.endpoint("ollama")
-        if not self.health("ollama"):
-            log_file = open(BENCH_STATE_DIR / "ollama.log", "ab")
-            proc = subprocess.Popen(["ollama", "serve"], stdout=log_file,
-                                    stderr=subprocess.STDOUT, cwd=str(PROJECT_DIR))
-            self._procs["ollama"] = proc
-            self._server_model["ollama"] = ""
-            if not self._wait_healthy("ollama", 60):
-                raise RuntimeError("ollama serve did not become healthy in 60s")
-        model_id = model_id_for("ollama", model_key)
-        # Ensure the model is pulled (no-op if present).
-        r = httpx.get(f"{ep}/api/tags", timeout=10)
-        have = {m.get("name") for m in r.json().get("models", [])}
-        if model_id not in have:
-            self._ollama_create_from_gguf(model_key, model_id)
-        return ep, model_id
-
-    def _ollama_create_from_gguf(self, model_key: str, model_id: str) -> None:
-        """Create an Ollama model from a local GGUF via a Modelfile."""
-        gguf = Path(ollama_gguf(model_key))
-        if not gguf.exists():
-            raise RuntimeError(f"GGUF not found for ollama import: {gguf}")
-        modelfile = BENCH_STATE_DIR / f"Modelfile-{model_key}"
-        modelfile.write_text(
-            f"FROM {gguf}\n"
-            f"PARAMETER num_ctx {CONTEXT_WINDOW}\n"
-            f"PARAMETER num_predict {MAX_OUTPUT_TOKENS}\n"
-        )
-        r = subprocess.run(["ollama", "create", model_id, "-f", str(modelfile)],
-                           capture_output=True, text=True, timeout=1800)
-        if r.returncode != 0:
-            raise RuntimeError(f"ollama create failed: {r.stderr[-500:]}")
-
     def release(self, framework: str, model_key: str) -> None:
-        """Unload the model / stop the server (load-run-unload residency)."""
+        """Unload the model / stop the server (load-run-unload residency).
+
+        The gateway drops the previous framework's model copy here, so the
+        next cell never runs with two model copies resident at once.
+        """
         if framework == "omlx":
             # Leave oMLX resident models as-is unless explicitly asked to free RAM.
-            return
-        if framework == "ollama":
-            model_id = model_id_for("ollama", model_key)
-            try:
-                httpx.post(f"{self.endpoint('ollama')}/api/delete",
-                           json={"name": model_id}, timeout=60)
-            except httpx.HTTPError:
-                pass
             return
         self._stop_server(framework)
 
@@ -378,6 +311,7 @@ class BenchResult:
     ttft_ms: list[float] = field(default_factory=list)
     total_ms: list[float] = field(default_factory=list)
     tokens: list[int] = field(default_factory=list)
+    agent_iters: list[int] = field(default_factory=list)  # agent turns/steps per iteration
     error: str = ""
     work_dir: str = ""
 
@@ -398,6 +332,7 @@ class BenchResult:
             # Non-streaming harness (agent CLIs): TPS over total task time.
             tps = toks / (total / 1000.0) if total > 0 else 0.0
             ttft_field = {"avg_ttft_ms": None}
+        agent_iters = statistics.mean(self.agent_iters) if self.agent_iters else None
         return {
             "status": "success",
             "ok": self.ok,
@@ -406,72 +341,9 @@ class BenchResult:
             "avg_total_ms": round(total, 1),
             "avg_tokens": round(toks, 1),
             "avg_tps": round(tps, 2),
+            "avg_agent_iters": round(agent_iters, 2) if agent_iters is not None else None,
             "work_dir": self.work_dir,
         }
-
-
-def _run_raw(endpoint: str, model_id: str, prompt: str, iterations: int,
-             max_tokens: int, progress_cb=None) -> BenchResult:
-    """Direct streaming HTTP to /v1/chat/completions (baseline harness).
-
-    One streaming call per iteration with ``stream_options.include_usage``.
-    TTFT and total time are measured locally (portable); the token count comes
-    from the standard ``usage.completion_tokens`` in the final chunk.
-    """
-    cb = progress_cb or _noop
-    res = BenchResult(harness="raw", framework="", model=model_id, iterations=iterations)
-    url = f"{endpoint}/v1/chat/completions"
-    with httpx.Client(timeout=600) as client:
-        for i in range(iterations):
-            cb(f"raw iteration {i + 1}/{iterations}")
-            unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
-            body = {"model": model_id,
-                    "messages": [{"role": "user", "content": unique}],
-                    "max_tokens": max_tokens,
-                    "stream": True,
-                    "stream_options": {"include_usage": True}}
-            t0 = time.time()
-            ttft = None
-            tokens = 0
-            try:
-                with client.stream("POST", url, json=body) as r:
-                    if r.status_code != 200:
-                        res.failed += 1
-                        res.error = f"HTTP {r.status_code}: {r.read()[:200]}"
-                        continue
-                    for line in r.iter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        usage = chunk.get("usage")
-                        if usage and usage.get("completion_tokens"):
-                            tokens = int(usage["completion_tokens"])
-                        delta = (chunk.get("choices") or [{}])[0].get("delta", {})
-                        if ttft is None and (delta.get("content")
-                                             or delta.get("reasoning_content")
-                                             or delta.get("reasoning")):
-                            ttft = time.time() - t0
-                total = time.time() - t0
-                if ttft is None:
-                    res.failed += 1
-                    res.error = "no tokens received"
-                    continue
-                if tokens <= 0:
-                    tokens = max(int(total * 20), 1)  # fallback estimate
-                res.ok += 1
-                res.ttft_ms.append(ttft * 1000)
-                res.total_ms.append(total * 1000)
-                res.tokens.append(tokens)
-            except httpx.HTTPError as e:
-                res.failed += 1
-                res.error = str(e)
-    return res
 
 
 def _write_pi_config(config_dir: Path, endpoint: str, model_id: str) -> None:
@@ -487,8 +359,8 @@ def _write_pi_config(config_dir: Path, endpoint: str, model_id: str) -> None:
                     "id": model_id,
                     "name": "bench",
                     "input": ["text"],
-                    "contextWindow": 32000,
-                    "maxTokens": 2048,
+                    "contextWindow": CONTEXT_WINDOW,
+                    "maxTokens": MAX_OUTPUT_TOKENS,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 }],
             }
@@ -499,8 +371,19 @@ def _write_pi_config(config_dir: Path, endpoint: str, model_id: str) -> None:
 
 def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
             max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
+    """Run the pi CLI as a full agent (tools enabled) in an isolated work dir.
+
+    Uses ``--mode json`` and streams the event stream live to capture exact
+    metrics: agent iterations (``turn_end`` events), output tokens (per
+    assistant ``message_end`` usage), and TTFT (first streamed delta).
+    No timeout: long-running tasks run to completion.
+    """
     cb = progress_cb or _noop
     res = BenchResult(harness="pi", framework="", model=model_id, iterations=iterations)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = config_dir.parent / "pi-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    res.work_dir = str(work_dir)
     _write_pi_config(config_dir, endpoint, model_id)
     env = dict(os.environ)
     env["PI_CODING_AGENT_DIR"] = str(config_dir)
@@ -509,34 +392,65 @@ def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
     env.pop("PI_PROVIDER", None)
     env.pop("PI_MODEL", None)
     for i in range(iterations):
-        cb(f"pi iteration {i + 1}/{iterations}")
+        cb(f"pi iteration {i + 1}/{iterations} (agent working in {work_dir.name})")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
         t0 = time.time()
+        turns = 0
+        out_tokens = 0
+        ttft = None
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 ["pi", "-p", unique, "--model", f"bench/{model_id}",
-                 "--no-tools", "--no-approve"],
-                capture_output=True, text=True, timeout=300, env=env,
-                cwd=str(PROJECT_DIR),
+                 "--no-approve", "--mode", "json"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=env, cwd=str(work_dir),
             )
-            out = proc.stdout.strip()
-            if proc.returncode == 0 and out:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = ev.get("type")
+                if etype == "turn_end":
+                    turns += 1
+                elif etype == "message_end":
+                    msg = ev.get("message") or {}
+                    if msg.get("role") == "assistant":
+                        out_tokens += int((msg.get("usage") or {}).get("output") or 0)
+                elif etype == "message_update" and ttft is None:
+                    ame = ev.get("assistantMessageEvent") or {}
+                    if ame.get("delta"):
+                        ttft = time.time() - t0
+            proc.wait()
+            total = time.time() - t0
+            stderr = proc.stderr.read() if proc.stderr else ""
+            if proc.returncode == 0 and out_tokens > 0:
                 res.ok += 1
-                res.total_ms.append((time.time() - t0) * 1000)
-                # Estimate tokens from output length (~4 chars/token).
-                res.tokens.append(max(len(out) // 4, 1))
+                res.total_ms.append(total * 1000)
+                res.tokens.append(out_tokens)
+                res.agent_iters.append(turns)
+                if ttft is not None:
+                    res.ttft_ms.append(ttft * 1000)
             else:
                 res.failed += 1
-                res.error = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-300:]
-        except subprocess.TimeoutExpired:
+                res.error = (stderr or f"rc={proc.returncode}")[-300:]
+        except Exception as e:  # noqa: BLE001
             res.failed += 1
-            res.error = "timeout"
+            res.error = str(e)[-300:]
     return res
 
 
 def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
              max_tokens: int, profile_dir: Path, progress_cb=None) -> BenchResult:
-    """Use omp's built-in `bench` against an isolated bench provider."""
+    """Use omp's built-in `bench` against an isolated bench provider.
+
+    Each bench run is a single request, so agent iterations = 1 per run.
+    No timeout: long-running tasks run to completion.
+    """
     cb = progress_cb or _noop
     res = BenchResult(harness="omp", framework="", model=model_id, iterations=iterations)
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -548,7 +462,7 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
                 "apiKey": "local",
                 "models": [{
                     "id": model_id, "name": "bench", "input": ["text"],
-                    "contextWindow": 32000, "maxTokens": max(2048, max_tokens),
+                    "contextWindow": CONTEXT_WINDOW, "maxTokens": MAX_OUTPUT_TOKENS,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 }],
             }
@@ -564,7 +478,7 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
         proc = subprocess.run(
             ["omp", "bench", f"bench/{model_id}", "--runs", str(iterations),
              "--profile", "chat", "--max-tokens", str(max_tokens), "--json"],
-            capture_output=True, text=True, timeout=900, env=env, cwd=str(PROJECT_DIR),
+            capture_output=True, text=True, env=env, cwd=str(PROJECT_DIR),
         )
         out = proc.stdout.strip()
         start = out.find("{")
@@ -591,27 +505,32 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
             res.ttft_ms = [float(r.get("ttftMs") or 0) for r in ok_runs]
             res.total_ms = [float(r.get("durationMs") or 0) for r in ok_runs]
             res.tokens = [int(r.get("outputTokens") or 0) for r in ok_runs]
+            res.agent_iters = [1] * len(ok_runs)  # one request per bench run
         if res.ok == 0:
             res.error = (m.get("error") or "all runs failed")[-300:]
-    except subprocess.TimeoutExpired:
-        res.error = "timeout"
     except json.JSONDecodeError as e:
         res.error = f"JSON parse error: {e}"
     return res
 
 
-def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
+def _run_opencode(endpoint: str, model_id: str, prompt: str, iterations: int,
                   max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
     """Run opencode with the Sisyphus (oh-my-opencode) agent against an isolated provider.
 
-    The agent runs in an isolated work dir (``config_dir.parent / "sisyphus-work"``)
+    The agent runs in an isolated work dir (``config_dir.parent / "opencode-work"``)
     so any files it creates (e.g. an HTML page) land there, not in the project.
     The work dir is recorded in ``res.work_dir``.
+
+    Metrics from the ``--format json`` event stream: agent iterations
+    (``step_finish`` events) and output tokens (per-step usage). opencode
+    emits completed parts only (no per-token deltas), so TTFT is not
+    measurable and TPS is output tokens over total task time. No timeout:
+    long-running tasks run to completion.
     """
     cb = progress_cb or _noop
-    res = BenchResult(harness="sisyphus", framework="", model=model_id, iterations=iterations)
+    res = BenchResult(harness="opencode", framework="", model=model_id, iterations=iterations)
     config_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = config_dir.parent / "sisyphus-work"
+    work_dir = config_dir.parent / "opencode-work"
     work_dir.mkdir(parents=True, exist_ok=True)
     res.work_dir = str(work_dir)
     cfg = {
@@ -622,7 +541,9 @@ def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Bench",
                 "options": {"baseURL": f"{endpoint}/v1", "apiKey": "local"},
-                "models": {model_id: {"name": "bench"}},
+                "models": {model_id: {"name": "bench",
+                                      "limit": {"context": CONTEXT_WINDOW,
+                                               "output": MAX_OUTPUT_TOKENS}}},
             }
         },
     }
@@ -631,17 +552,18 @@ def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
     env = dict(os.environ)
     env["OPENCODE_CONFIG"] = str(cfg_path)
     for i in range(iterations):
-        cb(f"sisyphus iteration {i + 1}/{iterations} (agent working in {work_dir.name})")
+        cb(f"opencode iteration {i + 1}/{iterations} (agent working in {work_dir.name})")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
         t0 = time.time()
+        steps = 0
+        out_tokens = 0
         try:
             proc = subprocess.run(
                 ["opencode", "run", unique, "-m", f"bench/{model_id}",
                  "--agent", "Sisyphus", "--format", "json"],
-                capture_output=True, text=True, timeout=1800, env=env, cwd=str(work_dir),
+                capture_output=True, text=True, env=env, cwd=str(work_dir),
             )
             total = time.time() - t0
-            out_tokens = 0
             for line in proc.stdout.splitlines():
                 line = line.strip()
                 if not line.startswith("{"):
@@ -651,125 +573,26 @@ def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
                 except json.JSONDecodeError:
                     continue
                 if ev.get("type") == "step_finish":
-                    out_tokens += int((ev.get("part", {}).get("tokens") or {}).get("output") or 0)
+                    steps += 1
+                    out_tokens += int((ev.get("part") or {}).get("tokens", {}).get("output") or 0)
             if proc.returncode == 0 and out_tokens > 0:
                 res.ok += 1
                 res.total_ms.append(total * 1000)
                 res.tokens.append(out_tokens)
+                res.agent_iters.append(steps)
             else:
                 res.failed += 1
                 res.error = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-300:]
-        except subprocess.TimeoutExpired:
+        except Exception as e:  # noqa: BLE001
             res.failed += 1
-            res.error = "timeout"
-    return res
-
-
-def _run_dsh(endpoint: str, model_id: str, prompt: str, iterations: int,
-             max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
-    """Run the DeepSeek Harness (dsh) headless profile against an isolated DSH_HOME."""
-    cb = progress_cb or _noop
-    res = BenchResult(harness="dsh", framework="", model=model_id, iterations=iterations)
-    dsh_home = config_dir / "dsh-home"
-    dsh_home.mkdir(parents=True, exist_ok=True)
-    patch = (
-        "- id: agent-default-model\n"
-        "  config:\n"
-        "    provider: deepseek-official\n"
-        f"    model: {model_id}\n"
-    )
-    (dsh_home / "cordis.patch.yml").write_text(patch)
-    env = dict(os.environ)
-    env["DSH_HOME"] = str(dsh_home)
-    env["DEEPSEEK_BASE_URL"] = f"{endpoint}/v1"
-    env["DEEPSEEK_API_KEY"] = "local"
-    env["DSH_TELEMETRY_DISABLED"] = "1"
-    for i in range(iterations):
-        cb(f"dsh iteration {i + 1}/{iterations}")
-        unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
-        t0 = time.time()
-        try:
-            proc = subprocess.run(
-                ["npx", "-y", "@deepseek-ai/dsh", "--profile", "headless", unique],
-                capture_output=True, text=True, timeout=600, env=env, cwd=str(PROJECT_DIR),
-            )
-            total = time.time() - t0
-            out = proc.stdout.strip()
-            # dsh prints "reasoning:\n<reasoning>\n\n<response>"; take the response.
-            response = out
-            if "reasoning:" in out:
-                after = out.split("reasoning:", 1)[1]
-                parts = after.split("\n\n", 1)
-                if len(parts) == 2:
-                    response = parts[1].strip()
-            if proc.returncode == 0 and response:
-                res.ok += 1
-                res.total_ms.append(total * 1000)
-                res.tokens.append(max(len(response) // 4, 1))
-            else:
-                res.failed += 1
-                res.error = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-300:]
-        except subprocess.TimeoutExpired:
-            res.failed += 1
-            res.error = "timeout"
-    return res
-
-
-def _run_bionic(endpoint: str, model_id: str, prompt: str, iterations: int,
-                max_tokens: int, progress_cb=None) -> BenchResult:
-    """Bionic (LM Studio GUI coding agent) harness.
-
-    Bionic is a GUI app (``/Applications/Bionic.app``) that drives the LM Studio
-    server on port 1234. Its full agent behaviour (tool use, multi-step) can
-    only be exercised through the GUI, so this harness measures the LM Studio
-    server that Bionic uses. The model must be **loaded** in LM Studio (via
-    Bionic.app) before running; the loaded model is used. If ``model_id`` is
-    given and is loaded, it is preferred.
-    """
-    cb = progress_cb or _noop
-    lms_ep = "http://127.0.0.1:1234"
-    res = BenchResult(harness="bionic", framework="lmstudio", model="", iterations=iterations)
-    try:
-        # /api/v0/models exposes per-model state (loaded / not-loaded).
-        r = httpx.get(f"{lms_ep}/api/v0/models", timeout=5)
-        r.raise_for_status()
-        all_models = r.json().get("data", [])
-    except httpx.HTTPError as e:
-        res.failed = iterations
-        res.error = (f"bionic's LM Studio server ({lms_ep}) is not reachable ({e}). "
-                     "Start Bionic.app, enable its local server, then retry.")
-        return res
-    loaded = [m["id"] for m in all_models if m.get("state") == "loaded"]
-    if model_id and model_id in loaded:
-        target = model_id
-    elif loaded:
-        target = loaded[0]
-    else:
-        res.failed = iterations
-        names = ", ".join(m.get("id", "?")[:12] for m in all_models[:5]) or "none"
-        res.error = ("No model is LOADED in the LM Studio server (listed: "
-                     f"{names}). Load the model in Bionic.app's GUI first, then retry.")
-        return res
-    res.model = target
-    cb(f"bionic: using loaded model {target[:12]}… ({iterations} iterations)")
-    # Delegate to the raw streaming harness against the LM Studio server.
-    inner = _run_raw(lms_ep, target, prompt, iterations, max_tokens, cb)
-    res.ok = inner.ok
-    res.failed = inner.failed
-    res.ttft_ms = inner.ttft_ms
-    res.total_ms = inner.total_ms
-    res.tokens = inner.tokens
-    res.error = inner.error
+            res.error = str(e)[-300:]
     return res
 
 
 HARNESS_RUNNERS = {
-    "raw": _run_raw,
-    "bionic": _run_bionic,
     "pi": _run_pi,
     "omp": _run_omp,
-    "sisyphus": _run_sisyphus,
-    "dsh": _run_dsh,
+    "opencode": _run_opencode,
 }
 
 
@@ -801,20 +624,6 @@ def run_benchmark(framework: str, model_key: str, harness: str,
     work_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     try:
-        if harness == "bionic":
-            # Bionic drives the LM Studio server (port 1234), not the framework
-            # endpoint, so skip the framework ensure/release for this cell.
-            cb("connecting to bionic / LM Studio server")
-            endpoint, model_id = "http://127.0.0.1:1234", ""
-            res = _run_bionic(endpoint, model_id, prompt, iterations, max_tokens, cb)
-            summary = res.summary()
-            summary.update({
-                "framework": framework, "model": model_key, "model_id": res.model,
-                "harness": harness, "endpoint": endpoint, "iterations": iterations,
-                "warmup": 0, "max_tokens": max_tokens,
-                "elapsed_s": round(time.time() - started, 1),
-            })
-            return summary
         cb(f"starting {framework} server")
         endpoint, model_id = manager.ensure(framework, model_key)
         cb("server ready")
@@ -825,15 +634,9 @@ def run_benchmark(framework: str, model_key: str, harness: str,
         for _ in range(max(warmup, 0)):
             cb("warmup")
             _warmup_once(runner, harness, endpoint, model_id, prompt, max_tokens, work_dir)
-        if harness in ("raw", "bionic"):
-            cb(f"running {harness} ({iterations} iterations)")
-            res = runner(endpoint, model_id, prompt, iterations, max_tokens, cb)
-        elif harness in ("pi", "omp", "sisyphus", "dsh"):
-            cb(f"running {harness} ({iterations} iterations)")
-            res = runner(endpoint, model_id, prompt, iterations, max_tokens,
-                         work_dir / f"{harness}-config", cb)
-        else:
-            return {"status": "failed", "error": f"no runner for harness '{harness}'"}
+        cb(f"running {harness} ({iterations} iterations)")
+        res = runner(endpoint, model_id, prompt, iterations, max_tokens,
+                     work_dir / f"{harness}-config", cb)
         summary = res.summary()
         summary.update({
             "framework": framework,
@@ -853,7 +656,7 @@ def run_benchmark(framework: str, model_key: str, harness: str,
                 "harness": harness, "error": str(e),
                 "elapsed_s": round(time.time() - started, 1)}
     finally:
-        if unload_after and harness != "bionic":
+        if unload_after:
             cb("releasing server")
             try:
                 manager.release(framework, model_key)
@@ -867,10 +670,7 @@ def _warmup_once(runner, harness: str, endpoint: str, model_id: str,
                  prompt: str, max_tokens: int, work_dir: Path) -> None:
     """Run one uncounted iteration to warm up the server/model."""
     try:
-        if harness == "raw":
-            runner(endpoint, model_id, prompt, 1, max_tokens)
-        elif harness in ("pi", "omp", "sisyphus", "dsh"):
-            runner(endpoint, model_id, prompt, 1, max_tokens, work_dir / f"{harness}-config")
+        runner(endpoint, model_id, prompt, 1, max_tokens, work_dir / f"{harness}-config")
     except Exception:  # noqa: BLE001 - warmup failures are non-fatal
         pass
 
@@ -886,10 +686,8 @@ def available_options() -> dict[str, Any]:
             if not art:
                 frameworks[fw] = False  # no artifact for this model -> grey out
                 continue
-            if fw in ("mlx", "llamacpp"):
+            if fw == "llamacpp":
                 frameworks[fw] = bool(art.get("path")) and Path(art["path"]).exists()
-            elif fw == "ollama":
-                frameworks[fw] = bool(art.get("gguf")) and Path(art["gguf"]).exists()
             else:  # omlx, mtplx (model resolved by id at run time)
                 frameworks[fw] = True
         models.append({"key": key, "label": spec["label"], "frameworks": frameworks})
@@ -925,7 +723,7 @@ def main() -> None:
     p_run.add_argument("--model", required=True, choices=list(MODELS))
     p_run.add_argument("--harness", required=True, choices=list(HARNESS_RUNNERS))
     p_run.add_argument("--iterations", type=int, default=3)
-    p_run.add_argument("--max-tokens", type=int, default=128)
+    p_run.add_argument("--max-tokens", type=int, default=32768)
     p_run.add_argument("--keep-loaded", action="store_true",
                        help="do not unload after the run")
 
