@@ -36,7 +36,12 @@ MoE model id: `mlx-community--Qwen3.6-35B-A3B-6bit`
 - Dense model: `scottlowry/Qwen3.8-27B-oQ6e-mtp` (OptiQ 6-bit **MTP**, MLX-format,
   native 256K context). Same build oMLX serves; already in the HF cache.
 - The request `model` id is the HF repo name (`scottlowry/Qwen3.8-27B-oQ6e-mtp`).
-- `mlx_lm.server` loads the MTP model but does not run MTP spec decoding.
+- **No MTP spec decoding:** `mlx_lm.server`'s `qwen3_5.py` loader strips `mtp.*`
+  weights, so it serves the base model only. The standalone MTP drafter repos
+  (`mlx-community/Qwen3.8-27B-MTP-4bit`/`-8bit`, model type `qwen3_5_mtp`) are
+  sidecars (31 tensors, only `layers.0`) and mlx-lm 0.31.3 has no `qwen3_5_mtp`
+  model file, so they can't be used as `--draft-model`. MTP speedup is covered
+  by MTPLX / llama.cpp / oMLX.
 
 ### MTPLX — `mtplx serve` (:8400)
 ```bash
@@ -63,18 +68,6 @@ llama-server \
   ~55-65%, mean ~2.7 tokens/step).
 - The request `model` id is the alias (`qwen3_8_27b`).
 
-### Ollama (:11434)
-```bash
-# server (if not already running)
-ollama serve
-
-# create the model from the local MTP GGUF (one-time; ~minutes)
-printf 'FROM models/gguf/Qwen3.8-27B-MTP-Q6_K.gguf\nPARAMETER num_ctx 131072\nPARAMETER num_predict 32768\n' > /tmp/Modelfile-qwen38
-ollama create bench/qwen38-27b-q6 -f /tmp/Modelfile-qwen38
-```
-- The request `model` id is the Ollama name (`bench/qwen38-27b-q6`).
-- Ollama auto-loads the model on first request (no MTP spec decoding).
-
 ### Bionic (LM Studio GUI) — LM Studio server (:1234)
 Bionic is a GUI app (`/Applications/Bionic.app`); it has no headless CLI. It
 drives the LM Studio server on :1234. To benchmark it:
@@ -96,7 +89,6 @@ curl -s http://127.0.0.1:1234/v1/models
 | MLX (mlx_lm.server) | 8200 | no |
 | MTPLX | 8400 | no |
 | llama.cpp | 8300 | no |
-| Ollama | 11434 | no (server) / model auto-loads |
 | Bionic (LM Studio) | 1234 | no (GUI-managed) |
 
 ## RAM note (M5 Max, 128 GB)

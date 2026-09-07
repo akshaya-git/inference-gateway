@@ -1199,13 +1199,20 @@ async def _lab_run(job_id: str, framework: str, model_key: str, harness: str,
                    iterations: int, max_tokens: int, prompt: str) -> None:
     job = lab_jobs[job_id]
     job["status"] = "running"
-    job["stage"] = "ensuring framework + model"
+    job["stage"] = "starting"
+
+    def _progress(stage: str) -> None:
+        # Called from the benchmark worker thread; update the job's stage so the
+        # dashboard can show live progress.
+        job["stage"] = stage
+        job["stage_at"] = time.time()
+
     try:
         result = await asyncio.to_thread(
             benchmark_lab.run_benchmark,
             framework, model_key, harness,
             iterations, max_tokens, prompt,
-            True, 1, _lab_manager, None,
+            True, 1, _lab_manager, None, _progress,
         )
         job["result"] = result
         job["status"] = "done" if result.get("status") == "success" else "failed"
@@ -2598,7 +2605,7 @@ async function loadLabOptions(){try{const r=await fetch('/lab/options',{cache:'n
 function applyLabAvailability(){if(!labOptions)return;const model=$('labModel'),framework=$('labFramework');if(!model||!framework)return;const mSpec=labOptions.models.find(m=>m.key===model.value);for(const opt of framework.options){const ok=!mSpec||!!mSpec.frameworks[opt.value];opt.disabled=!ok}if(framework.options[framework.selectedIndex]&&framework.options[framework.selectedIndex].disabled){const first=[...framework.options].find(o=>!o.disabled);if(first)framework.value=first.value}}
 async function renderLabResults(){try{const r=await fetch('/lab/results',{cache:'no-store'}),d=await r.json();const rows=(d.history||[]).map(x=>`<tr><td>${new Date((x.created_at||0)*1000).toLocaleTimeString()}</td><td>${esc(x.model)}</td><td>${esc(x.framework)}</td><td>${esc(x.harness)}</td><td class=${x.status==='success'?'good':'bad'}>${esc(x.status)}</td><td>${x.avg_ttft_ms==null?'—':sec(x.avg_ttft_ms)}</td><td>${x.avg_total_ms==null?'—':sec(x.avg_total_ms)}</td><td>${val(x.avg_tokens)}</td><td>${x.avg_tps?x.avg_tps.toFixed(1):'—'}</td><td>${val(x.iterations)}</td><td class=reason>${esc(x.error||'')}</td></tr>`).join('');$('labRows').innerHTML=rows||'<tr><td colspan=11>No lab results yet</td></tr>'}catch(e){}}
 async function runLabCell(){const framework=$('labFramework').value,model=$('labModel').value,harness=$('labHarness').value,iterations=parseInt($('labIters').value,10)||3,max_tokens=parseInt($('labMaxTok').value,10)||128,prompt=($('labPrompt')?$('labPrompt').value:'');$('runLab').disabled=true;$('labMsg').textContent='Queuing lab cell…';try{const r=await fetch('/lab/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({framework,model,harness,iterations,max_tokens,prompt})});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);labJobId=d.id;pollLabJob(d.id)}catch(e){$('labMsg').textContent='Error: '+e.message;$('runLab').disabled=false}}
-async function pollLabJob(jobId){clearInterval(labPollTimer);labPollTimer=setInterval(async()=>{try{const r=await fetch('/lab/status/'+encodeURIComponent(jobId),{cache:'no-store'}),j=await r.json();$('labJob').innerHTML=`<b>${esc(j.framework)} × ${esc(j.model)} × ${esc(j.harness)}</b> — status: <span class=${j.status==='failed'?'bad':j.status==='done'?'good':'warn'}>${esc(j.status)}</span> · stage: ${esc(j.stage||'—')}${j.result&&j.result.status==='success'?` · TTFT ${j.result.avg_ttft_ms==null?'—':sec(j.result.avg_ttft_ms)} · total ${sec(j.result.avg_total_ms)} · ${val(j.result.avg_tokens)} tok · ${j.result.avg_tps?j.result.avg_tps.toFixed(1):'—'} t/s`:''}`;if(j.status==='done'||j.status==='failed'){clearInterval(labPollTimer);labPollTimer=null;$('runLab').disabled=false;$('labMsg').textContent=j.status==='done'?'Lab cell complete.':'Lab cell failed: '+(j.result?.error||'unknown');renderLabResults()}}catch(e){}},1500)}
+async function pollLabJob(jobId){clearInterval(labPollTimer);labPollTimer=setInterval(async()=>{try{const r=await fetch('/lab/status/'+encodeURIComponent(jobId),{cache:'no-store'}),j=await r.json();const wd=j.result&&j.result.work_dir?` · output: <code>${esc(j.result.work_dir)}</code>`:'';$('labJob').innerHTML=`<b>${esc(j.framework)} × ${esc(j.model)} × ${esc(j.harness)}</b> — status: <span class=${j.status==='failed'?'bad':j.status==='done'?'good':'warn'}>${esc(j.status)}</span> · stage: ${esc(j.stage||'—')}${j.result&&j.result.status==='success'?` · TTFT ${j.result.avg_ttft_ms==null?'—':sec(j.result.avg_ttft_ms)} · total ${sec(j.result.avg_total_ms)} · ${val(j.result.avg_tokens)} tok · ${j.result.avg_tps?j.result.avg_tps.toFixed(1):'—'} t/s${wd}`:''}${j.status==='running'&&j.stage_at?` <span class=muted>(updated ${Math.round((Date.now()/1000-j.stage_at))}s ago)</span>`:''}`;if(j.status==='done'||j.status==='failed'){clearInterval(labPollTimer);labPollTimer=null;$('runLab').disabled=false;$('labMsg').textContent=j.status==='done'?'Lab cell complete.':'Lab cell failed: '+(j.result?.error||'unknown');renderLabResults()}}catch(e){}},1500)}
 async function clearLabHistory(){try{const r=await fetch('/lab/clear',{method:'POST'});const d=await r.json();if(!r.ok)throw Error(d.error||r.statusText);renderLabResults()}catch(e){$('labMsg').textContent='Error: '+e.message}}
 loadLabOptions();renderLabResults();
 </script></body></html>"""

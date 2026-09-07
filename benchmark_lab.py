@@ -97,7 +97,7 @@ FRAMEWORKS: dict[str, dict[str, Any]] = {
     "mlx": {"port": 8200, "resident": False, "label": "MLX (mlx_lm.server)"},
     "mtplx": {"port": 8400, "resident": False, "label": "MTPLX (MTP MLX)"},
     "llamacpp": {"port": 8300, "resident": False, "label": "llama.cpp (llama-server)"},
-    "ollama": {"port": 11434, "resident": False, "label": "Ollama"},
+    # Ollama dropped from the lab (redundant with llama.cpp for GGUF models).
 }
 
 HARNESSES: dict[str, dict[str, Any]] = {
@@ -114,6 +114,10 @@ BENCH_PROMPT = (
     "Explain, in exactly three short sentences, how a load balancer decides "
     "which backend server should handle an incoming request."
 )
+
+
+def _noop(stage: str) -> None:
+    """Default no-op progress callback."""
 
 
 def _artifact(framework: str, model_key: str) -> dict[str, Any] | None:
@@ -375,11 +379,12 @@ class BenchResult:
     total_ms: list[float] = field(default_factory=list)
     tokens: list[int] = field(default_factory=list)
     error: str = ""
+    work_dir: str = ""
 
     def summary(self) -> dict[str, Any]:
         if not self.ok:
             return {"status": "failed", "error": self.error or "no successful runs",
-                    "ok": 0, "failed": self.failed}
+                    "ok": 0, "failed": self.failed, "work_dir": self.work_dir}
         total = statistics.mean(self.total_ms)
         toks = statistics.mean(self.tokens)
         if self.ttft_ms:
@@ -401,21 +406,24 @@ class BenchResult:
             "avg_total_ms": round(total, 1),
             "avg_tokens": round(toks, 1),
             "avg_tps": round(tps, 2),
+            "work_dir": self.work_dir,
         }
 
 
 def _run_raw(endpoint: str, model_id: str, prompt: str, iterations: int,
-             max_tokens: int) -> BenchResult:
+             max_tokens: int, progress_cb=None) -> BenchResult:
     """Direct streaming HTTP to /v1/chat/completions (baseline harness).
 
     One streaming call per iteration with ``stream_options.include_usage``.
     TTFT and total time are measured locally (portable); the token count comes
     from the standard ``usage.completion_tokens`` in the final chunk.
     """
+    cb = progress_cb or _noop
     res = BenchResult(harness="raw", framework="", model=model_id, iterations=iterations)
     url = f"{endpoint}/v1/chat/completions"
     with httpx.Client(timeout=600) as client:
-        for _ in range(iterations):
+        for i in range(iterations):
+            cb(f"raw iteration {i + 1}/{iterations}")
             unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
             body = {"model": model_id,
                     "messages": [{"role": "user", "content": unique}],
@@ -490,7 +498,8 @@ def _write_pi_config(config_dir: Path, endpoint: str, model_id: str) -> None:
 
 
 def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
-            max_tokens: int, config_dir: Path) -> BenchResult:
+            max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
+    cb = progress_cb or _noop
     res = BenchResult(harness="pi", framework="", model=model_id, iterations=iterations)
     _write_pi_config(config_dir, endpoint, model_id)
     env = dict(os.environ)
@@ -499,7 +508,8 @@ def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
     env["PI_SKIP_VERSION_CHECK"] = "1"
     env.pop("PI_PROVIDER", None)
     env.pop("PI_MODEL", None)
-    for _ in range(iterations):
+    for i in range(iterations):
+        cb(f"pi iteration {i + 1}/{iterations}")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
         t0 = time.time()
         try:
@@ -525,8 +535,9 @@ def _run_pi(endpoint: str, model_id: str, prompt: str, iterations: int,
 
 
 def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
-             max_tokens: int, profile_dir: Path) -> BenchResult:
+             max_tokens: int, profile_dir: Path, progress_cb=None) -> BenchResult:
     """Use omp's built-in `bench` against an isolated bench provider."""
+    cb = progress_cb or _noop
     res = BenchResult(harness="omp", framework="", model=model_id, iterations=iterations)
     profile_dir.mkdir(parents=True, exist_ok=True)
     cfg = {
@@ -548,6 +559,7 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
     env["PI_CODING_AGENT_DIR"] = str(profile_dir)
     env["PI_OFFLINE"] = "1"
     env["PI_SKIP_VERSION_CHECK"] = "1"
+    cb(f"omp bench ({iterations} runs)")
     try:
         proc = subprocess.run(
             ["omp", "bench", f"bench/{model_id}", "--runs", str(iterations),
@@ -589,10 +601,19 @@ def _run_omp(endpoint: str, model_id: str, prompt: str, iterations: int,
 
 
 def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
-                  max_tokens: int, config_dir: Path) -> BenchResult:
-    """Run opencode with the Sisyphus (oh-my-opencode) agent against an isolated provider."""
+                  max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
+    """Run opencode with the Sisyphus (oh-my-opencode) agent against an isolated provider.
+
+    The agent runs in an isolated work dir (``config_dir.parent / "sisyphus-work"``)
+    so any files it creates (e.g. an HTML page) land there, not in the project.
+    The work dir is recorded in ``res.work_dir``.
+    """
+    cb = progress_cb or _noop
     res = BenchResult(harness="sisyphus", framework="", model=model_id, iterations=iterations)
     config_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = config_dir.parent / "sisyphus-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    res.work_dir = str(work_dir)
     cfg = {
         "$schema": "https://opencode.ai/config.json",
         "plugin": ["oh-my-openagent@latest"],
@@ -609,14 +630,15 @@ def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
     cfg_path.write_text(json.dumps(cfg, indent=2))
     env = dict(os.environ)
     env["OPENCODE_CONFIG"] = str(cfg_path)
-    for _ in range(iterations):
+    for i in range(iterations):
+        cb(f"sisyphus iteration {i + 1}/{iterations} (agent working in {work_dir.name})")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
         t0 = time.time()
         try:
             proc = subprocess.run(
                 ["opencode", "run", unique, "-m", f"bench/{model_id}",
                  "--agent", "Sisyphus", "--format", "json"],
-                capture_output=True, text=True, timeout=600, env=env, cwd=str(PROJECT_DIR),
+                capture_output=True, text=True, timeout=1800, env=env, cwd=str(work_dir),
             )
             total = time.time() - t0
             out_tokens = 0
@@ -644,8 +666,9 @@ def _run_sisyphus(endpoint: str, model_id: str, prompt: str, iterations: int,
 
 
 def _run_dsh(endpoint: str, model_id: str, prompt: str, iterations: int,
-             max_tokens: int, config_dir: Path) -> BenchResult:
+             max_tokens: int, config_dir: Path, progress_cb=None) -> BenchResult:
     """Run the DeepSeek Harness (dsh) headless profile against an isolated DSH_HOME."""
+    cb = progress_cb or _noop
     res = BenchResult(harness="dsh", framework="", model=model_id, iterations=iterations)
     dsh_home = config_dir / "dsh-home"
     dsh_home.mkdir(parents=True, exist_ok=True)
@@ -661,7 +684,8 @@ def _run_dsh(endpoint: str, model_id: str, prompt: str, iterations: int,
     env["DEEPSEEK_BASE_URL"] = f"{endpoint}/v1"
     env["DEEPSEEK_API_KEY"] = "local"
     env["DSH_TELEMETRY_DISABLED"] = "1"
-    for _ in range(iterations):
+    for i in range(iterations):
+        cb(f"dsh iteration {i + 1}/{iterations}")
         unique = f"{prompt} [id:{uuid.uuid4().hex[:8]}]"
         t0 = time.time()
         try:
@@ -692,35 +716,44 @@ def _run_dsh(endpoint: str, model_id: str, prompt: str, iterations: int,
 
 
 def _run_bionic(endpoint: str, model_id: str, prompt: str, iterations: int,
-                max_tokens: int) -> BenchResult:
+                max_tokens: int, progress_cb=None) -> BenchResult:
     """Bionic (LM Studio GUI coding agent) harness.
 
     Bionic is a GUI app (``/Applications/Bionic.app``) that drives the LM Studio
     server on port 1234. Its full agent behaviour (tool use, multi-step) can
     only be exercised through the GUI, so this harness measures the LM Studio
-    server that Bionic uses. The model must be loaded in LM Studio (via
-    Bionic.app) before running; the first loaded model is used.
+    server that Bionic uses. The model must be **loaded** in LM Studio (via
+    Bionic.app) before running; the loaded model is used. If ``model_id`` is
+    given and is loaded, it is preferred.
     """
+    cb = progress_cb or _noop
     lms_ep = "http://127.0.0.1:1234"
     res = BenchResult(harness="bionic", framework="lmstudio", model="", iterations=iterations)
     try:
-        r = httpx.get(f"{lms_ep}/v1/models", timeout=5)
+        # /api/v0/models exposes per-model state (loaded / not-loaded).
+        r = httpx.get(f"{lms_ep}/api/v0/models", timeout=5)
         r.raise_for_status()
-        models = [m["id"] for m in r.json().get("data", [])]
+        all_models = r.json().get("data", [])
     except httpx.HTTPError as e:
         res.failed = iterations
         res.error = (f"bionic's LM Studio server ({lms_ep}) is not reachable ({e}). "
-                     "Start Bionic.app, load the model in its GUI, then retry.")
+                     "Start Bionic.app, enable its local server, then retry.")
         return res
-    if not models:
+    loaded = [m["id"] for m in all_models if m.get("state") == "loaded"]
+    if model_id and model_id in loaded:
+        target = model_id
+    elif loaded:
+        target = loaded[0]
+    else:
         res.failed = iterations
-        res.error = ("No model loaded in the LM Studio server. Load one via "
-                     "Bionic.app, then retry.")
+        names = ", ".join(m.get("id", "?")[:12] for m in all_models[:5]) or "none"
+        res.error = ("No model is LOADED in the LM Studio server (listed: "
+                     f"{names}). Load the model in Bionic.app's GUI first, then retry.")
         return res
-    target = model_id if model_id in models else models[0]
     res.model = target
+    cb(f"bionic: using loaded model {target[:12]}… ({iterations} iterations)")
     # Delegate to the raw streaming harness against the LM Studio server.
-    inner = _run_raw(lms_ep, target, prompt, iterations, max_tokens)
+    inner = _run_raw(lms_ep, target, prompt, iterations, max_tokens, cb)
     res.ok = inner.ok
     res.failed = inner.failed
     res.ttft_ms = inner.ttft_ms
@@ -751,12 +784,17 @@ def run_benchmark(framework: str, model_key: str, harness: str,
                   unload_after: bool = True,
                   warmup: int = 1,
                   manager: FrameworkManager | None = None,
-                  work_dir: Path | None = None) -> dict[str, Any]:
+                  work_dir: Path | None = None,
+                  progress_cb=None) -> dict[str, Any]:
     """Run one (framework, model, harness) benchmark cell. Returns a result dict.
 
     ``warmup`` uncounted iterations are run first to absorb server/model warmup
     (important for server frameworks where the first request is slow).
+
+    ``progress_cb`` is an optional callable ``cb(stage: str)`` invoked at key
+    points so a caller (e.g. the dashboard) can show live progress.
     """
+    cb = progress_cb or _noop
     own_manager = manager is None
     manager = manager or FrameworkManager()
     work_dir = work_dir or (BENCH_STATE_DIR / "work" / f"{framework}-{model_key}-{harness}")
@@ -766,8 +804,9 @@ def run_benchmark(framework: str, model_key: str, harness: str,
         if harness == "bionic":
             # Bionic drives the LM Studio server (port 1234), not the framework
             # endpoint, so skip the framework ensure/release for this cell.
+            cb("connecting to bionic / LM Studio server")
             endpoint, model_id = "http://127.0.0.1:1234", ""
-            res = _run_bionic(endpoint, model_id, prompt, iterations, max_tokens)
+            res = _run_bionic(endpoint, model_id, prompt, iterations, max_tokens, cb)
             summary = res.summary()
             summary.update({
                 "framework": framework, "model": model_key, "model_id": res.model,
@@ -776,18 +815,23 @@ def run_benchmark(framework: str, model_key: str, harness: str,
                 "elapsed_s": round(time.time() - started, 1),
             })
             return summary
+        cb(f"starting {framework} server")
         endpoint, model_id = manager.ensure(framework, model_key)
+        cb("server ready")
         runner = HARNESS_RUNNERS.get(harness)
         if runner is None:
             return {"status": "failed", "error": f"no runner for harness '{harness}'"}
         # Warmup (uncounted) — absorbs first-request latency.
         for _ in range(max(warmup, 0)):
+            cb("warmup")
             _warmup_once(runner, harness, endpoint, model_id, prompt, max_tokens, work_dir)
         if harness in ("raw", "bionic"):
-            res = runner(endpoint, model_id, prompt, iterations, max_tokens)
+            cb(f"running {harness} ({iterations} iterations)")
+            res = runner(endpoint, model_id, prompt, iterations, max_tokens, cb)
         elif harness in ("pi", "omp", "sisyphus", "dsh"):
+            cb(f"running {harness} ({iterations} iterations)")
             res = runner(endpoint, model_id, prompt, iterations, max_tokens,
-                         work_dir / f"{harness}-config")
+                         work_dir / f"{harness}-config", cb)
         else:
             return {"status": "failed", "error": f"no runner for harness '{harness}'"}
         summary = res.summary()
@@ -800,6 +844,7 @@ def run_benchmark(framework: str, model_key: str, harness: str,
             "iterations": iterations,
             "warmup": warmup,
             "max_tokens": max_tokens,
+            "work_dir": str(work_dir),
             "elapsed_s": round(time.time() - started, 1),
         })
         return summary
@@ -809,6 +854,7 @@ def run_benchmark(framework: str, model_key: str, harness: str,
                 "elapsed_s": round(time.time() - started, 1)}
     finally:
         if unload_after and harness != "bionic":
+            cb("releasing server")
             try:
                 manager.release(framework, model_key)
             except Exception:  # noqa: BLE001

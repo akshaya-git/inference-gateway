@@ -7,10 +7,12 @@ model is transient on top of the always-resident oMLX routing models.
 ## Axes
 
 ### Models (logical)
-| key | label | oMLX id | MLX (mlx_lm.server) | MTPLX | llama.cpp GGUF | Ollama name |
-|-----|-------|---------|---------------------|-------|----------------|-------------|
-| `qwen3.6-35b-a3b` | Qwen3.6 35B-A3B (6-bit) | `mlx-community--Qwen3.6-35B-A3B-6bit` | `mlx-community/Qwen3.6-35B-A3B-6bit` | — | `Qwen3.6-35B-A3B-UD-Q6_K.gguf` | `bench/qwen36-35b-a3b-q6` |
-| `qwen3.8-27b` | Qwen3.8 27B (6-bit, **MTP**) | `scottlowry--Qwen3.8-27B-oQ6e-mtp` | `scottlowry/Qwen3.8-27B-oQ6e-mtp` | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` | `Qwen3.8-27B-MTP-Q6_K.gguf` | `bench/qwen38-27b-q6` |
+| key | label | oMLX id | MLX (mlx_lm.server) | MTPLX | llama.cpp GGUF |
+|-----|-------|---------|---------------------|-------|----------------|
+| `qwen3.6-35b-a3b` | Qwen3.6 35B-A3B (6-bit) | `mlx-community--Qwen3.6-35B-A3B-6bit` | `mlx-community/Qwen3.6-35B-A3B-6bit` | — | `Qwen3.6-35B-A3B-UD-Q6_K.gguf` |
+| `qwen3.8-27b` | Qwen3.8 27B (6-bit, **MTP**) | `scottlowry--Qwen3.8-27B-oQ6e-mtp` | `scottlowry/Qwen3.8-27B-oQ6e-mtp` | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` | `Qwen3.8-27B-MTP-Q6_K.gguf` |
+
+> **Ollama dropped** from the lab (redundant with llama.cpp for GGUF models).
 
 The registry in `benchmark_lab.py` (`MODELS`) maps each logical model to a
 **per-framework artifact** (`artifacts[framework]`). A (model, framework) combo
@@ -21,22 +23,28 @@ for the routing models).
 > **MTP per framework:** each framework uses its own MTP build (they support
 > different formats). The dense model is MTP everywhere:
 > - **oMLX / MLX**: `scottlowry/Qwen3.8-27B-oQ6e-mtp` (OptiQ 6-bit MTP, MLX-format,
->   native 256K context, `mtp_num_hidden_layers=1`). oMLX and `mlx_lm.server`
->   are both MLX-based so they share this build. (The `lukaskremla`/`mlx-community`
->   `MTP-6bit`/`MTP-8bit` repos are drafter sidecars only, not standalone.)
+>   native 256K context, `mtp_num_hidden_layers=1`, model type `qwen3_5_text`).
+>   oMLX and `mlx_lm.server` are both MLX-based so they share this build.
 > - **MTPLX**: `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality` (native MTP spec decoding).
-> - **llama.cpp / Ollama**: `Jackrong/Qwen3.8-27B-MTP-Q6_K.gguf` (Q6_K with MTP tensors).
+> - **llama.cpp**: `Jackrong/Qwen3.8-27B-MTP-Q6_K.gguf` (Q6_K with MTP tensors).
 >
 > **MTP speculative decoding is active in:** oMLX (built-in), MTPLX (native),
-> and llama.cpp (`--spec-type draft-mtp`). `mlx_lm.server` and Ollama load the
-> MTP model but do not run MTP spec decoding (they serve the base model).
+> and llama.cpp (`--spec-type draft-mtp`).
+>
+> **`mlx_lm.server` cannot do MTP spec decoding.** Its `qwen3_5.py` model loader
+> explicitly strips `mtp.*` weights (`weights = {k: v for k, v in weights.items()
+> if "mtp." not in k}`), so it serves the base model only. The standalone MTP
+> drafter repos (`mlx-community/Qwen3.8-27B-MTP-4bit`/`-8bit`, ~0.25–0.48 GB,
+> model type `qwen3_5_mtp`) are **sidecars, not full models** (31 tensors, only
+> `layers.0`), and mlx-lm 0.31.3 (latest) has no `qwen3_5_mtp` model file, so
+> they can't be used as a `--draft-model` either. MTP speedup is therefore
+> covered by MTPLX / llama.cpp / oMLX, not `mlx_lm.server`.
 
 ### Context / output budget
 Every framework server is configured with **131K context** (`CONTEXT_WINDOW=
 131072`) and **32K max output** (`MAX_OUTPUT_TOKENS=32768`):
 - llama.cpp: `--ctx-size 131072 --spec-type draft-mtp`
 - MTPLX: `--context-window 131072 --max-tokens 32768`
-- Ollama: Modelfile `PARAMETER num_ctx 131072` / `num_predict 32768`
 - MLX: `--max-tokens 32768` (context is the model's native 256K; KV grows lazily)
 - oMLX: `router.yaml` `context_window: 131072` / `max_output: 32768`
 
@@ -47,7 +55,6 @@ Every framework server is configured with **131K context** (`CONTEXT_WINDOW=
 | `mlx` | `mlx_lm.server` (bench venv) | 8200 | started per cell, killed after |
 | `mtplx` | `mtplx serve` (native MTP speculative decoding) | 8400 | started per cell, stopped after |
 | `llamacpp` | `llama-server` (brew) | 8300 | started per cell, killed after |
-| `ollama` | Ollama (brew) | 11434 | model created from GGUF, deleted after |
 
 `FrameworkManager.ensure(framework, model)` returns `(endpoint, model_id)`;
 `release()` tears the framework's copy down. oMLX uses the admin API
@@ -66,9 +73,25 @@ MTPLX serves OpenAI-compatible on :8400 (`mtplx serve --model <id> --no-auth`).
 
 Agent harnesses (pi, sisyphus, dsh) do not stream, so TTFT is null and TPS is
 output tokens over total task time. omp's built-in bench streams, so it reports
-real TTFT + generation TPS. **Bionic** is a GUI app with no headless CLI; its
-harness measures the LM Studio server (port 1234) it drives — the model must be
-loaded in Bionic.app first.
+real TTFT + generation TPS.
+
+**Bionic** is a GUI app with no headless CLI; its harness measures the LM
+Studio server (port 1234) it drives. The model must be **loaded** in
+Bionic.app's GUI first (the harness reads `/api/v0/models` and uses the loaded
+model; if none is loaded it fails with a clear "load the model in Bionic.app"
+error). It measures the LM Studio server, not Bionic's full agent behaviour.
+
+**Sisyphus** runs opencode in an **isolated work dir**
+(`.inference-stack/bench/work/<fw>-<model>-sisyphus/sisyphus-work`), so any
+files the agent creates (e.g. an HTML page) land there, not in the project.
+The work dir is reported in the result (`work_dir`) and shown in the dashboard.
+The opencode subprocess timeout is 1800 s (agent tasks can be long).
+
+### Live progress
+Every lab job reports its stage live via a progress callback (the dashboard
+polls `/lab/status/{id}` every 1.5 s). Stages: `starting <fw> server` →
+`server ready` → `warmup` → `<harness> iteration N/M` → `releasing server` →
+`complete`. The stage timestamp (`stage_at`) lets the UI show "updated Ns ago".
 
 ## Residency model (two layers)
 - **Resident:** oMLX + the two routing models (serves the gateway, normal
